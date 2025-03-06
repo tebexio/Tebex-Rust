@@ -71,8 +71,19 @@ namespace Tebex.API
                 UsernameId = usernameId;
                 EventType = eventType;
                 EventDate = eventDate;
-                IpAddress = ipAddress;
+                IpAddress = AnonymizeIp(ipAddress);
             }
+        }
+        
+        public static string AnonymizeIp(string ipIn)
+        {
+            int lastOctetStart = ipIn.LastIndexOf('.');
+            if (lastOctetStart < 0)
+            {
+                return ipIn;
+            }
+            
+            return ipIn.Substring(0, lastOctetStart) + ".x";
         }
         
         public void PlayerJoinEvent(List<TebexJoinEventInfo> events, ApiSuccessCallback onSuccess, ApiErrorCallback onApiError = null,
