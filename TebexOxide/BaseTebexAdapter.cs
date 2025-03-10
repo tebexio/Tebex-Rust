@@ -561,7 +561,7 @@ namespace Tebex.Adapters
                 foreach (var duePlayer in response.Players)
                 {
                     LogDebug($"Processing online commands for player {duePlayer.Name}...");
-                    object playerRef = GetPlayerRef(duePlayer.Id.ToString());
+                    object playerRef = GetPlayerRef(duePlayer.UUID);
                     if (playerRef == null)
                     {
                         LogDebug($"> Player {duePlayer.Name} has online commands but is no ref found (are they connected?) Skipping.");
