@@ -1,0 +1,15 @@
+{
+  "secret_key": "",
+  "buy_command": "buy",
+  "disable_ui": true,
+  "admin_command": "tebex",
+  "debug": false,
+  "auto_report_logs": true,
+  "enable_basket": true,
+  "track_permissions": true,
+  "custom_permission_commands": [],
+  "queue_check_seconds": 120,
+  "listing_refresh_seconds": 120,
+  "telemetry_flush_seconds": 120,
+  "join_flush_seconds": 60
+}
