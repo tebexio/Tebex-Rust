@@ -1,14 +1,18 @@
+
 ![Logo](https://www.tebex.io/_nuxt/logo.BCN2mLkL.svg)
 # Tebex Plugin for Rust Game Servers
 
-Monetize your Rust server with the same tools used by FiveM and Hypixel. Sell items, subscriptions, and passes while Tebex handles payments, tax compliance, and risk all at a flat 5% fee.
+Monetize your Rust server with the same tools used by FiveM and Hypixel. Sell items, subscriptions, and passes while Tebex handles payments, tax compliance, and risk all at a **flat 5% fee**.
 
-This is our Oxide plugin designed specifically for Rust game server administrators.
+This is our Oxide plugin designed specifically for Rust game server administrators, rebuilt from the ground-up based on community feedback.
 
 ## Features
 - **Permission Replay**: Easily re-apply your players' permissions/groups after server wipes. All saved locally and fully customizable.
 - **In-Game Storefront UI**: Players can browse an in-game representation of your store, if enabled.
 - **QR Checkout**: Scan a QR code to checkout and pay with a mobile device instead of leaving the game.
+
+<img width="1290" height="949" alt="1" src="https://github.com/user-attachments/assets/0050bd6c-4df4-4010-9b3d-c776bd0f7e95" />
+<img width="1287" height="949" alt="2" src="https://github.com/user-attachments/assets/8f46daff-71b9-48b4-9deb-e702c3daf51a" />
 
 ## Installation and Setup
 To install, simply upload the `TebexPlugin.cs` source file to the `oxide/plugins` directory of your game server.
@@ -79,7 +83,6 @@ The plugin is highly configurable to support a wide range of setups, both vanill
 | Store & Checkout | `/tebex sendlink <pkg> <user>` | Send a checkout link to a player |
 | Store & Checkout | `/tebex goals` | Show community goal progress |
 | User Management | `/tebex ban <name> <reason> [ip]` | Ban a player from the webstore |
-| User Management | `/tebex lookup <username>` | Not available in this build |
 | Debug | `/tebex debug` | Opens the Plugin Health Check UI (or prints status from console) |
 | Debug | `/tebex debug <true\|false>` | Toggle verbose server logging |
 | Debug | `/tebex selftest` | Run the permission-ledger self-check |
