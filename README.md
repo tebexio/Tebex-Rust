@@ -1,75 +1,118 @@
-# Tebex Oxide Plugin for Rust and 7 Days To Die
 
-## Description
-[Tebex](https://tebex.io/) provides a monetization and donation platform for game servers, allowing server owners to manage in-game purchases, subscriptions, and donations with ease.
+![Logo](https://www.tebex.io/_nuxt/logo.BCN2mLkL.svg)
+# Tebex Plugin for Rust Game Servers
 
-This plugin acts as a bridge between your **Rust** game server and the **Tebex platform**, enabling you to offer a wide range of virtual items, packages, and services to your players.
+Monetize your Rust server with the same tools used by FiveM and Hypixel. Sell items, subscriptions, and passes while Tebex handles payments, tax compliance, and risk all at a **flat 5% fee**.
 
-As this is an Oxide plugin, it is also compatible with **7 Days to Die**.
+This is our Oxide plugin designed specifically for Rust game server administrators, rebuilt from the ground-up based on community feedback.
+
+## Features
+- **Permission Replay**: Easily re-apply your players' permissions/groups after server wipes. All saved locally and fully customizable.
+- **In-Game Storefront UI**: Players can browse an in-game representation of your store, if enabled.
+- **QR Checkout**: Scan a QR code to checkout and pay with a mobile device instead of leaving the game.
+
+<img width="1290" height="949" alt="1" src="https://github.com/user-attachments/assets/0050bd6c-4df4-4010-9b3d-c776bd0f7e95" />
+<img width="1287" height="949" alt="2" src="https://github.com/user-attachments/assets/8f46daff-71b9-48b4-9deb-e702c3daf51a" />
+
+## Installation and Setup
+To install, simply upload the `TebexPlugin.cs` source file to the `oxide/plugins` directory of your game server.
+
+You must [Create a Game Server](https://creator.tebex.io/) on your Tebex store to receive the key used to link your server.
+
+Use the `tebex secret <key>` command as an administrator to set your game server key. Alternatively, it can be added to the config at `oxide/config/TebexPlugin.json`.
+
+You may also use the `TEBEX_SECRET_KEY` environment variable which will override any configuration value.
+
+## Configuration
+
+The plugin is highly configurable to support a wide range of setups, both vanilla and modded. Below is the default configuration generated at startup:
+
+```json
+{
+  "secret_key": "",
+  "buy_command": "buy",
+  "disable_ui": true,
+  "admin_command": "tebex",
+  "debug": false,
+  "auto_report_logs": true,
+  "enable_basket": true,
+  "track_permissions": true,
+  "custom_permission_commands": [],
+  "queue_check_seconds": 120,
+  "listing_refresh_seconds": 120,
+  "telemetry_flush_seconds": 120,
+  "join_flush_seconds": 60
+}
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `secret_key` | `""` | Your webstore's plugin secret key from the Tebex control panel |
+| `buy_command` | `"buy"` | Chat command name that opens the store for players. |
+| `admin_command` | `"tebex"` | Chat command name for all admin subcommands. |
+| `disable_ui` | `true` | Toggle the full in-game storefront. Note: your server may be categorized as modded if UI is enabled. |
+| `debug` | `false` | Enables verbose server-log output. |
+| `auto_report_logs` | `true` | Whether the plugin sends telemetry/error events. |
+| `enable_basket` | `true` | Enables selecting multiple items from the in-game storefront. |
+| `track_permissions` | `true` | Enables the permission replay feature, which saves any permissions issued. |
+| `custom_permission_commands` | `[]` | List of `{ label, grant_command, revoke_command }` deliverable commands so they're tracked and replayable too. |
+| `queue_check_seconds` | `120` | Baseline interval (seconds) between polls of the Tebex command queue for due purchases. Minimum is 30s. |
+| `listing_refresh_seconds` | `120` | How often package/category listings and community goals are re-fetched from Tebex. Minimum is 30s. |
+| `telemetry_flush_seconds` | `120` | How often telemetry events are sent to Tebex. Minimum is 30s. |
+| `join_flush_seconds` | `60` | How often player-join events are sent to Tebex. Minimum is 15s. |
 
 ## Commands
-The following commands are available through the Tebex Rust Plugin:
 
-### Admin Commands
-- `/tebex.secret <secret>`: Set your server's secret key
-- `/tebex.sendlink <player> <packageId>`: Send a purchase link for a package to a player.
-- `/tebex.forcecheck`: Force run any due online and offline commands.
-- `/tebex.refresh`: Refresh your store's listings.
-- `/tebex.report`: Prepare a report that can be submitted to our support team.
-- `/tebex.ban`: Ban a player from using the store. **Players can only be unbanned from the webstore UI.**
-- `/tebex.lookup`: Display information about a customer.
+### User command
 
-### User Commands
-- `/tebex.help`: Display a list of available commands and their descriptions.
-- `/tebex.info`: Display public store information.
-- `/tebex.categories`: View all store categories.
-- `/tebex.packages`: View all store packages.
-- `/tebex.checkout <packageId>`: Create a checkout link for a package.
-- `/tebex.stats`: View your own player statistics in the store.
+| Command | Access | Description |
+|---|---|---|
+| `/buy` | Everyone | Opens the in-game CUI store (browse categories/packages, basket, checkout, QR code). Falls back to printing the webstore link in console/chat if `disable_ui` is on. |
 
-## Installation
-To install the Tebex Rust Plugin, follow these steps:
+### Admin commands (`/tebex <subcommand>`, requires `tebex.admin` or server console)
 
-1. Download the latest release of this plugin from [Tebex.io](https://docs.tebex.io/plugin/official-plugins), or choose the latest [Release](https://github.com/tebexio/Tebex-Rust/releases) from this repository.
-2. Upload the plugin .cs source file to the `oxide/plugins` directory of your game server.
-3. Start the game server. If it is already running, it should automatically load the plugin. If not, run `oxide.reload Tebex` to load the plugin.
+| Section | Command | Description |
+|---|---|---|
+| Configuration | `/tebex secret <key>` | Set the webstore secret key |
+| Configuration | `/tebex info` | Show server and account information |
+| Configuration | `/tebex reload` | Reload configuration and listings |
+| Queue & Delivery | `/tebex forcecheck` | Run a queue check right now |
+| Queue & Delivery | `/tebex forcecheck <user>` | Check online commands for one cached user |
+| Queue & Delivery | `/tebex replay <user\|all>` | Re-apply tracked permissions after a wipe |
+| Store & Checkout | `/tebex checkout <pkgId>` | Get yourself an instant checkout link |
+| Store & Checkout | `/tebex sendlink <pkg> <user>` | Send a checkout link to a player |
+| Store & Checkout | `/tebex goals` | Show community goal progress |
+| User Management | `/tebex ban <name> <reason> [ip]` | Ban a player from the webstore |
+| Debug | `/tebex debug` | Opens the Plugin Health Check UI (or prints status from console) |
+| Debug | `/tebex debug <true\|false>` | Toggle verbose server logging |
+| Debug | `/tebex selftest` | Run the permission-ledger self-check |
+| Debug | `/tebex help` | Opens the command reference |
 
-## Dev Environment Setup
-If you wish to contribute to the development of the plugin, you can set up your development environment as follows:
+**Notes:**
+- `admin_command` and `buy_command` are configurable. `tebex`/`buy` are just the defaults.
 
-**Requirements:**
-- Python 3
-- dotnet
-- [Oxide](https://umod.org/games/rust)
+## Permission Replay
+Permission Replay lets you restore the permissions and groups your players **purchased** through your Tebex store after a server wipe, without asking buyers to re-purchase and without manually re-issuing commands.
 
-**Setup Instructions:**
-1. Clone the repository to an empty folder.
-2. Download [Oxide](https://umod.org/games/rust) and unzip it.
-3. Add the assemblies `Oxide.Core`, `Oxide.CSharp`, `Oxide.MySql`, `Oxide.Rust`, and `Facebunch.UnityEngine`, `Assembly-CSharp` as a minimum to the project.
+When a Tebex package delivers an Oxide permission or group, the plugin records who got what. After a wipe (or any time Oxide permissions get reset), you can run `tebex replay <username|all>` to re-apply tracked purchases.
 
-## Building and Testing
-Oxide plugins are basic .cs source files - we do not build a .dll or an executable. Instead, we combine our source files
-together then ensure it can compile and run on a real server. You can configure a test server in `BuildConfig.py`
+## Tracking custom (non-Oxide) permissions
 
-1. Ensure your development environment is properly set up per the instructions above.
-2. Using `BuildConfig.py.example`, make a `BuildConfig.py` and fill the appropriate values.
-3. Run `python3 Build.py`.
+If your perks are granted by another plugin instead of Oxide's built-in permissions, for example a VIP manager with `addvip` / `delvip`, teach the ledger about that plugin's grant/revoke commands with `custom_permission_commands` in the config:
 
-This will merge any source files configured in `BuildConfig.py` together into the final plugin in `Build/Tebex.cs`
+```json
+"custom_permission_commands": [
+  {
+    "label": "vip",
+    "grant_command": "addvip",
+    "revoke_command": "delvip"
+  }
+]
+```
 
-### Build Arguments
-The full build and test suite can be ran sequentially with these additional arguments:
+**Refunds/expiries** that come through as revoke commands automatically remove the entitlement, so a later `replay` won't re-grant something that was taken away.
 
-- `--DeployTest`: Runs a deployment script, ideally uploads to a test server.
-- `--TestRemoteReload`: Test connect to see if a remote Rust server can reload the plugin.
-- `--OpenDevConsole`: Open interactive RCON console on a test rust server.
-
-Each run of the build script will always merge and output the final plugin source file.
-
-## Contributions
-We welcome contributions from the community. Please refer to the `CONTRIBUTING.md` file for more details. By submitting code to us, you agree to the terms set out in the CONTRIBUTING.md file
+All tracked permissions are saved to a ledger file in `oxide/data/Tebex/permission_ledger.json`. It is safe to back this up.
 
 ## Support
 This repository is only used for bug reports via GitHub Issues. If you have found a bug, please [open an issue](https://github.com/tebexio/Tebex-Rust/issues).
-
-If you are a user requiring support for Tebex, please contact us at https://tebex.io/contact
