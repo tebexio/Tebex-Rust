@@ -1,7 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Text;
+using System.Text.RegularExpressions;
 using Facepunch.Extend;
 using Newtonsoft.Json;
 using Oxide.Core;
@@ -12,1635 +14,9 @@ using Oxide.Game.Rust.Cui;
 using Tebex.Plugin;
 using UnityEngine;
 
-namespace Tebex.QR
-{
-    public sealed class QrCode
-    {
-        public byte[] Bytes;
-
-        private QrCode(byte[] bytes) => Bytes = bytes;
-
-        public bool[,] GetModules()
-        {
-            int version = Bytes[0];
-            int size = Bytes[2];
-            var modules = new bool[size, size];
-            int bitIndex = 0;
-            for (int r = 0; r < size; r++)
-            for (int c = 0; c < size; c++)
-            {
-                int byteIndex = 3 + (bitIndex >> 3);
-                int bitInByte = 7 - (bitIndex & 7);
-                bool black = ((Bytes[byteIndex] >> bitInByte) & 1) != 0;
-                modules[r, c] = black;
-                bitIndex++;
-            }
-            return modules;
-        }
-
-        public static QrCode Encode(string content)
-        {
-            if (content == null) throw new ArgumentNullException(nameof(content));
-
-            if (!content.StartsWith("https://"))
-            {
-                throw new ArgumentException("Content must be a web address beginning with https://, got " + content);
-            }
-
-            if (content.Contains("javascript:"))
-            {
-                throw new ArgumentException("Content must not contain Javascript");
-            }
-
-            if (content.Contains("<script>"))
-            {
-                throw new ArgumentException("Content must not contain script tags");
-            }
-
-            if (content.Contains("eval(") || content.Contains("onerror=") || content.Contains("onload=") ||
-                content.Contains("document."))
-            {
-                throw new ArgumentException("Invalid content url");
-            }
-
-            byte[] dataBytes = Encoding.UTF8.GetBytes(content);
-
-            int version = ChooseVersionByteModeL(dataBytes.Length);
-            if (version == 0)
-                throw new ArgumentException("Content too long for versions 1..4 at EC Level L in this basic implementation.");
-
-            int size = 21 + 4 * (version - 1);
-
-            GetV1to4LParams(version, out int dataCodewords, out int eccCodewords, out int totalCodewords);
-
-            var bb = new BitBuffer();
-            bb.AppendBits(0b0100, 4);
-            bb.AppendBits(dataBytes.Length, 8);
-            foreach (byte b in dataBytes) bb.AppendBits(b, 8);
-
-            int totalDataBits = dataCodewords * 8;
-
-            int remaining = totalDataBits - bb.BitLength;
-            if (remaining > 0)
-                bb.AppendBits(0, Math.Min(4, remaining));
-
-            while ((bb.BitLength & 7) != 0) bb.AppendBits(0, 1);
-
-            bool toggle = true;
-            while (bb.BitLength < totalDataBits)
-            {
-                bb.AppendBits(toggle ? 0xEC : 0x11, 8);
-                toggle = !toggle;
-            }
-
-            byte[] dataCw = bb.ToBytes();
-            if (dataCw.Length != dataCodewords)
-                throw new InvalidOperationException("Unexpected data codeword length.");
-
-            byte[] eccCw = ReedSolomon.ComputeECC(dataCw, eccCodewords);
-
-            var allCw = new byte[totalCodewords];
-            Buffer.BlockCopy(dataCw, 0, allCw, 0, dataCw.Length);
-            Buffer.BlockCopy(eccCw, 0, allCw, dataCw.Length, eccCw.Length);
-
-            var modules = new bool[size, size];
-            var isFunction = new bool[size, size];
-
-            DrawFunctionPatterns(version, modules, isFunction);
-
-            PlaceCodewords(modules, isFunction, allCw);
-
-            int bestMask = -1;
-            int bestPenalty = int.MaxValue;
-            bool[,] best = null;
-
-            for (int mask = 0; mask < 8; mask++)
-            {
-                var temp = (bool[,])modules.Clone();
-                ApplyMask(temp, isFunction, mask);
-                WriteFormatInfo(temp, isFunction, ecLevelBits: 0b01, mask);
-                int penalty = PenaltyScore(temp);
-                if (penalty < bestPenalty)
-                {
-                    bestPenalty = penalty;
-                    bestMask = mask;
-                    best = temp;
-                }
-            }
-
-            byte[] packed = PackModules(best);
-            byte[] output = new byte[3 + packed.Length];
-            output[0] = (byte)version;
-            output[1] = 0;
-            output[2] = (byte)size;
-            Buffer.BlockCopy(packed, 0, output, 3, packed.Length);
-
-            return new QrCode(output);
-        }
-
-        public static string Decode(QrCode code)
-        {
-            if (code == null) throw new ArgumentNullException(nameof(code));
-
-            int version = code.Bytes[0];
-            int size = code.Bytes[2];
-            var modules = code.GetModules();
-
-            var isFunction = new bool[size, size];
-            var dummy = new bool[size, size];
-            DrawFunctionPatterns(version, dummy, isFunction);
-
-            int mask = ReadMaskFromFormat(modules);
-
-            ApplyMask(modules, isFunction, mask);
-
-            GetV1to4LParams(version, out int dataCodewords, out int eccCodewords, out int totalCodewords);
-            byte[] allCw = ReadCodewords(modules, isFunction, totalCodewords);
-
-            byte[] dataCw = new byte[dataCodewords];
-            Buffer.BlockCopy(allCw, 0, dataCw, 0, dataCodewords);
-
-            var br = new BitReader(dataCw);
-
-            int mode = br.ReadBits(4);
-            if (mode == 0) return "";
-            if (mode != 0b0100) throw new NotSupportedException("Only Byte mode is supported by this basic decoder.");
-
-            int count = br.ReadBits(8);
-            var payload = new byte[count];
-            for (int i = 0; i < count; i++)
-                payload[i] = (byte)br.ReadBits(8);
-
-            return Encoding.UTF8.GetString(payload);
-        }
-
-        private static int ChooseVersionByteModeL(int byteLen)
-        {
-            if (byteLen <= 17) return 1;
-            if (byteLen <= 32) return 2;
-            if (byteLen <= 53) return 3;
-            if (byteLen <= 78) return 4;
-            return 0;
-        }
-
-        private static void GetV1to4LParams(int version, out int data, out int ecc, out int total)
-        {
-            switch (version)
-            {
-                case 1: data = 19; ecc = 7; total = 26; return;
-                case 2: data = 34; ecc = 10; total = 44; return;
-                case 3: data = 55; ecc = 15; total = 70; return;
-                case 4: data = 80; ecc = 20; total = 100; return;
-                default: throw new NotSupportedException("This basic implementation supports versions 1..4 only.");
-            }
-        }
-
-        private static void DrawFunctionPatterns(int version, bool[,] modules, bool[,] isFunction)
-        {
-            int size = modules.GetLength(0);
-
-            DrawFinder(modules, isFunction, 0, 0);
-            DrawFinder(modules, isFunction, 0, size - 7);
-            DrawFinder(modules, isFunction, size - 7, 0);
-
-            DrawSeparators(isFunction, 0, 0);
-            DrawSeparators(isFunction, 0, size - 7);
-            DrawSeparators(isFunction, size - 7, 0);
-
-            for (int i = 8; i < size - 8; i++)
-            {
-                bool val = (i % 2) == 0;
-                modules[6, i] = val; isFunction[6, i] = true;
-                modules[i, 6] = val; isFunction[i, 6] = true;
-            }
-
-            int darkRow = 4 * version + 9;
-            modules[darkRow, 8] = true;
-            isFunction[darkRow, 8] = true;
-
-            ReserveFormatAreas(isFunction);
-
-            DrawAlignmentPatterns(version, modules, isFunction);
-
-        }
-
-        private static void DrawFinder(bool[,] modules, bool[,] isFunction, int top, int left)
-        {
-            for (int r = 0; r < 7; r++)
-            for (int c = 0; c < 7; c++)
-            {
-                int rr = top + r, cc = left + c;
-                bool on =
-                    (r == 0 || r == 6 || c == 0 || c == 6) ||
-                    (r >= 2 && r <= 4 && c >= 2 && c <= 4);
-
-                modules[rr, cc] = on;
-                isFunction[rr, cc] = true;
-            }
-        }
-
-        private static void DrawSeparators(bool[,] isFunction, int top, int left)
-        {
-            int size = isFunction.GetLength(0);
-
-            for (int i = -1; i <= 7; i++)
-            {
-                SetFunc(isFunction, top - 1, left + i, size);
-                SetFunc(isFunction, top + 7, left + i, size);
-                SetFunc(isFunction, top + i, left - 1, size);
-                SetFunc(isFunction, top + i, left + 7, size);
-            }
-        }
-
-        private static void SetFunc(bool[,] isFunction, int r, int c, int size)
-        {
-            if ((uint)r < (uint)size && (uint)c < (uint)size)
-                isFunction[r, c] = true;
-        }
-
-        private static void ReserveFormatAreas(bool[,] isFunction)
-        {
-            int size = isFunction.GetLength(0);
-
-            for (int i = 0; i < 9; i++)
-            {
-                if (i != 6)
-                {
-                    isFunction[8, i] = true;
-                    isFunction[i, 8] = true;
-                }
-            }
-
-            for (int i = 0; i < 8; i++)
-            {
-                isFunction[8, size - 1 - i] = true;
-                isFunction[size - 1 - i, 8] = true;
-            }
-
-            isFunction[8, 8] = true;
-        }
-
-        private static void DrawAlignmentPatterns(int version, bool[,] modules, bool[,] isFunction)
-        {
-            if (version == 1) return;
-
-            int size = modules.GetLength(0);
-            int center = size - 7;
-
-            DrawAlignment(modules, isFunction, center - 2, center - 2);
-        }
-
-        private static void DrawAlignment(bool[,] modules, bool[,] isFunction, int top, int left)
-        {
-            for (int r = 0; r < 5; r++)
-            for (int c = 0; c < 5; c++)
-            {
-                int rr = top + r, cc = left + c;
-                bool on =
-                    (r == 0 || r == 4 || c == 0 || c == 4) ||
-                    (r == 2 && c == 2);
-
-                modules[rr, cc] = on;
-                isFunction[rr, cc] = true;
-            }
-        }
-
-        private static void PlaceCodewords(bool[,] modules, bool[,] isFunction, byte[] codewords)
-        {
-            int size = modules.GetLength(0);
-
-            int bitIndex = 0;
-            int dir = -1;
-            int col = size - 1;
-
-            while (col > 0)
-            {
-                if (col == 6) col--;
-
-                for (int row = (dir == -1 ? size - 1 : 0);
-                     (dir == -1 ? row >= 0 : row < size);
-                     row += dir)
-                {
-                    for (int c = 0; c < 2; c++)
-                    {
-                        int x = col - c;
-                        if (isFunction[row, x]) continue;
-
-                        bool bit = GetBit(codewords, bitIndex++);
-                        modules[row, x] = bit;
-                    }
-                }
-
-                col -= 2;
-                dir = -dir;
-            }
-        }
-
-        private static bool GetBit(byte[] data, int bitIndex)
-        {
-            int byteIndex = bitIndex >> 3;
-            int bitInByte = 7 - (bitIndex & 7);
-            if (byteIndex >= data.Length) return false;
-            return ((data[byteIndex] >> bitInByte) & 1) != 0;
-        }
-
-        private static byte[] ReadCodewords(bool[,] modules, bool[,] isFunction, int totalCodewords)
-        {
-            int size = modules.GetLength(0);
-            int totalBits = totalCodewords * 8;
-            var outBytes = new byte[totalCodewords];
-
-            int bitIndex = 0;
-            int dir = -1;
-            int col = size - 1;
-
-            while (col > 0 && bitIndex < totalBits)
-            {
-                if (col == 6) col--;
-
-                for (int row = (dir == -1 ? size - 1 : 0);
-                     (dir == -1 ? row >= 0 : row < size);
-                     row += dir)
-                {
-                    for (int c = 0; c < 2; c++)
-                    {
-                        int x = col - c;
-                        if (isFunction[row, x]) continue;
-                        if (bitIndex >= totalBits) break;
-
-                        bool bit = modules[row, x];
-                        int byteIndex = bitIndex >> 3;
-                        int bitInByte = 7 - (bitIndex & 7);
-                        if (bit) outBytes[byteIndex] |= (byte)(1 << bitInByte);
-                        bitIndex++;
-                    }
-                    if (bitIndex >= totalBits) break;
-                }
-
-                col -= 2;
-                dir = -dir;
-            }
-
-            return outBytes;
-        }
-
-        private static void ApplyMask(bool[,] modules, bool[,] isFunction, int mask)
-        {
-            int size = modules.GetLength(0);
-            for (int r = 0; r < size; r++)
-            for (int c = 0; c < size; c++)
-            {
-                if (isFunction[r, c]) continue;
-                if (MaskBit(mask, r, c))
-                    modules[r, c] = !modules[r, c];
-            }
-        }
-
-        private static bool MaskBit(int mask, int r, int c)
-        {
-            return mask switch
-            {
-                0 => ((r + c) & 1) == 0,
-                1 => (r & 1) == 0,
-                2 => (c % 3) == 0,
-                3 => ((r + c) % 3) == 0,
-                4 => (((r / 2) + (c / 3)) & 1) == 0,
-                5 => ((r * c) % 2 + (r * c) % 3) == 0,
-                6 => ((((r * c) % 2) + ((r * c) % 3)) & 1) == 0,
-                7 => ((((r + c) % 2) + ((r * c) % 3)) & 1) == 0,
-                _ => throw new ArgumentOutOfRangeException(nameof(mask))
-            };
-        }
-
-        private static void WriteFormatInfo(bool[,] modules, bool[,] isFunction, int ecLevelBits, int mask)
-        {
-            int format = (ecLevelBits << 3) | mask;
-            int bch = ComputeBCH(format, 0b10100110111, 10);
-            int bits15 = ((format << 10) | bch) ^ 0x5412;
-
-            int size = modules.GetLength(0);
-
-            int[] rPos = { 8,8,8,8,8,8,8,8,7,5,4,3,2,1,0 };
-            int[] cPos = { 0,1,2,3,4,5,7,8,8,8,8,8,8,8,8 };
-
-            for (int i = 0; i < 15; i++)
-            {
-                bool bit = ((bits15 >> (14 - i)) & 1) != 0;
-                modules[rPos[i], cPos[i]] = bit;
-                isFunction[rPos[i], cPos[i]] = true;
-            }
-
-            for (int i = 0; i < 8; i++)
-            {
-                bool bit = ((bits15 >> i) & 1) != 0;
-                modules[8, size - 1 - i] = bit;
-                isFunction[8, size - 1 - i] = true;
-            }
-            for (int i = 8; i < 15; i++)
-            {
-                bool bit = ((bits15 >> i) & 1) != 0;
-                modules[size - 15 + i, 8] = bit;
-                isFunction[size - 15 + i, 8] = true;
-            }
-        }
-
-        private static int ReadMaskFromFormat(bool[,] modules)
-        {
-            int[] rPos = { 8,8,8,8,8,8,8,8,7,5,4,3,2,1,0 };
-            int[] cPos = { 0,1,2,3,4,5,7,8,8,8,8,8,8,8,8 };
-
-            int bits15 = 0;
-            for (int i = 0; i < 15; i++)
-            {
-                bits15 <<= 1;
-                if (modules[rPos[i], cPos[i]]) bits15 |= 1;
-            }
-            bits15 ^= 0x5412;
-            int format = bits15 >> 10;
-            return format & 0b111;
-        }
-
-        private static int ComputeBCH(int value, int poly, int polyShift)
-        {
-            int v = value << polyShift;
-            int msbPoly = HighestBit(poly);
-            while (HighestBit(v) >= msbPoly)
-            {
-                int shift = HighestBit(v) - msbPoly;
-                v ^= (poly << shift);
-            }
-            return v;
-        }
-
-        private static int HighestBit(int x)
-        {
-            int hb = -1;
-            while (x != 0) { x >>= 1; hb++; }
-            return hb;
-        }
-
-        private static int PenaltyScore(bool[,] m)
-        {
-            int size = m.GetLength(0);
-            int penalty = 0;
-
-            for (int r = 0; r < size; r++)
-            {
-                penalty += RunPenalty(GetRow(m, r));
-            }
-            for (int c = 0; c < size; c++)
-            {
-                penalty += RunPenalty(GetCol(m, c));
-            }
-
-            for (int r = 0; r < size - 1; r++)
-            for (int c = 0; c < size - 1; c++)
-            {
-                bool v = m[r, c];
-                if (m[r, c + 1] == v && m[r + 1, c] == v && m[r + 1, c + 1] == v)
-                    penalty += 3;
-            }
-
-            penalty += FinderLikePenalty(m);
-
-            int dark = 0;
-            for (int r = 0; r < size; r++)
-            for (int c = 0; c < size; c++)
-                if (m[r, c]) dark++;
-
-            int total = size * size;
-            int percent = (dark * 100) / total;
-            int k = Math.Abs(percent - 50) / 5;
-            penalty += k * 10;
-
-            return penalty;
-        }
-
-        private static bool[] GetRow(bool[,] m, int r)
-        {
-            int size = m.GetLength(0);
-            var a = new bool[size];
-            for (int i = 0; i < size; i++) a[i] = m[r, i];
-            return a;
-        }
-
-        private static bool[] GetCol(bool[,] m, int c)
-        {
-            int size = m.GetLength(0);
-            var a = new bool[size];
-            for (int i = 0; i < size; i++) a[i] = m[i, c];
-            return a;
-        }
-
-        private static int RunPenalty(bool[] line)
-        {
-            int p = 0;
-            int run = 1;
-            for (int i = 1; i < line.Length; i++)
-            {
-                if (line[i] == line[i - 1]) run++;
-                else
-                {
-                    if (run >= 5) p += 3 + (run - 5);
-                    run = 1;
-                }
-            }
-            if (run >= 5) p += 3 + (run - 5);
-            return p;
-        }
-
-        private static int FinderLikePenalty(bool[,] m)
-        {
-            int size = m.GetLength(0);
-            int p = 0;
-
-            for (int r = 0; r < size; r++)
-            {
-                for (int c = 0; c <= size - 11; c++)
-                {
-                    if (m[r, c] && !m[r, c + 1] && m[r, c + 2] && m[r, c + 3] && m[r, c + 4] && !m[r, c + 5] && m[r, c + 6] &&
-                        !m[r, c + 7] && !m[r, c + 8] && !m[r, c + 9] && !m[r, c + 10])
-                        p += 40;
-
-                    if (!m[r, c] && !m[r, c + 1] && !m[r, c + 2] && !m[r, c + 3] && m[r, c + 4] && !m[r, c + 5] && m[r, c + 6] &&
-                        m[r, c + 7] && m[r, c + 8] && !m[r, c + 9] && m[r, c + 10])
-                        p += 40;
-                }
-            }
-
-            for (int c = 0; c < size; c++)
-            {
-                for (int r = 0; r <= size - 11; r++)
-                {
-                    if (m[r, c] && !m[r + 1, c] && m[r + 2, c] && m[r + 3, c] && m[r + 4, c] && !m[r + 5, c] && m[r + 6, c] &&
-                        !m[r + 7, c] && !m[r + 8, c] && !m[r + 9, c] && !m[r + 10, c])
-                        p += 40;
-
-                    if (!m[r, c] && !m[r + 1, c] && !m[r + 2, c] && !m[r + 3, c] && m[r + 4, c] && !m[r + 5, c] && m[r + 6, c] &&
-                        m[r + 7, c] && m[r + 8, c] && !m[r + 9, c] && m[r + 10, c])
-                        p += 40;
-                }
-            }
-
-            return p;
-        }
-
-        private static byte[] PackModules(bool[,] modules)
-        {
-            int size = modules.GetLength(0);
-            int bitCount = size * size;
-            int byteCount = (bitCount + 7) / 8;
-            var packed = new byte[byteCount];
-
-            int bitIndex = 0;
-            for (int r = 0; r < size; r++)
-            for (int c = 0; c < size; c++)
-            {
-                if (modules[r, c])
-                {
-                    int b = bitIndex >> 3;
-                    int bitInByte = 7 - (bitIndex & 7);
-                    packed[b] |= (byte)(1 << bitInByte);
-                }
-                bitIndex++;
-            }
-
-            return packed;
-        }
-
-        private sealed class BitBuffer
-        {
-            private readonly List<byte> _bytes = new List<byte>();
-            private int _bitLen;
-
-            public int BitLength => _bitLen;
-
-            public void AppendBits(int value, int count)
-            {
-                if (count < 0 || count > 31) throw new ArgumentOutOfRangeException(nameof(count));
-                for (int i = count - 1; i >= 0; i--)
-                {
-                    int bit = (value >> i) & 1;
-                    AppendBit(bit != 0);
-                }
-            }
-
-            private void AppendBit(bool bit)
-            {
-                int byteIndex = _bitLen >> 3;
-                int bitInByte = 7 - (_bitLen & 7);
-                if (byteIndex == _bytes.Count) _bytes.Add(0);
-                if (bit) _bytes[byteIndex] |= (byte)(1 << bitInByte);
-                _bitLen++;
-            }
-
-            public byte[] ToBytes()
-            {
-                int byteCount = (_bitLen + 7) / 8;
-                var arr = _bytes.ToArray();
-                if (arr.Length == byteCount) return arr;
-                var outArr = new byte[byteCount];
-                Array.Copy(arr, outArr, byteCount);
-                return outArr;
-            }
-        }
-
-        private sealed class BitReader
-        {
-            private readonly byte[] _data;
-            private int _bitPos;
-
-            public BitReader(byte[] data) => _data = data ?? throw new ArgumentNullException(nameof(data));
-
-            public int ReadBits(int count)
-            {
-                int v = 0;
-                for (int i = 0; i < count; i++)
-                {
-                    int byteIndex = _bitPos >> 3;
-                    int bitInByte = 7 - (_bitPos & 7);
-                    int bit = ((_data[byteIndex] >> bitInByte) & 1);
-                    v = (v << 1) | bit;
-                    _bitPos++;
-                }
-                return v;
-            }
-        }
-
-        private static class ReedSolomon
-        {
-            private static readonly byte[] Exp = new byte[512];
-            private static readonly byte[] Log = new byte[256];
-
-            static ReedSolomon()
-            {
-                int x = 1;
-                for (int i = 0; i < 255; i++)
-                {
-                    Exp[i] = (byte)x;
-                    Log[(byte)x] = (byte)i;
-
-                    x <<= 1;
-                    if ((x & 0x100) != 0)
-                        x ^= 0x11D;
-
-                    x &= 0xFF;
-                }
-                for (int i = 255; i < 512; i++) Exp[i] = Exp[i - 255];
-            }
-
-            private static byte Mul(byte a, byte b)
-            {
-                if (a == 0 || b == 0) return 0;
-                int la = Log[a];
-                int lb = Log[b];
-                return Exp[la + lb];
-            }
-
-            public static byte[] ComputeECC(byte[] data, int eccLen)
-            {
-                byte[] gen = BuildGenerator(eccLen);
-
-                var ecc = new byte[eccLen];
-                foreach (byte d in data)
-                {
-                    byte factor = (byte)(d ^ ecc[0]);
-                    for (int i = 0; i < eccLen - 1; i++)
-                        ecc[i] = ecc[i + 1];
-
-                    ecc[eccLen - 1] = 0;
-
-                    for (int i = 0; i < eccLen; i++)
-                        ecc[i] ^= Mul(gen[i], factor);
-                }
-                return ecc;
-            }
-
-            private static byte[] BuildGenerator(int degree)
-            {
-                var poly = new List<byte> { 1 };
-                for (int i = 0; i < degree; i++)
-                {
-                    byte aPow = Exp[i];
-                    poly = PolyMul(poly, new List<byte> { 1, aPow });
-                }
-
-                var gen = new byte[degree];
-                for (int i = 0; i < degree; i++)
-                    gen[i] = poly[i + 1];
-                return gen;
-            }
-
-            private static List<byte> PolyMul(List<byte> p, List<byte> q)
-            {
-                var outp = new byte[p.Count + q.Count - 1];
-                for (int i = 0; i < p.Count; i++)
-                for (int j = 0; j < q.Count; j++)
-                    outp[i + j] ^= Mul(p[i], q[j]);
-                return new List<byte>(outp);
-            }
-        }
-    }
-}
-
-namespace Tebex.Headless
-{
-    #nullable enable
-        [Serializable]
-        public class AddPackagePayload
-        {
-            public int package_id;
-            public int quantity;
-            public Dictionary<string, string>? variable_data;
-
-            public AddPackagePayload(int packageId, int qty = 1, Dictionary<string, string>? variableData = null)
-            {
-                package_id = packageId;
-                quantity = qty;
-                variable_data = variableData;
-            }
-        }
-
-        [Serializable]
-        public class Basket
-        {
-            public string ident = string.Empty;
-            public bool complete;
-            public string email = string.Empty;
-            public string username = string.Empty;
-            public List<BasketCoupon> coupons = new List<BasketCoupon>();
-            public List<BasketGiftCard> gift_cards = new List<BasketGiftCard>();
-            public string creator_code = string.Empty;
-            public string cancel_url = string.Empty;
-            public string complete_url = string.Empty;
-            public bool complete_auto_redirect;
-            public string country = string.Empty;
-            public string ip = string.Empty;
-            public string username_id = string.Empty;
-            public float base_price;
-            public float sales_tax;
-            public float total_price;
-            public string currency = string.Empty;
-            public List<BasketPackage> packages = new List<BasketPackage>();
-            [JsonConverter(typeof(EmptyArrayTolerantConverter<Dictionary<string, string>>))]
-            public Dictionary<string, string> custom = new Dictionary<string, string>();
-            [JsonConverter(typeof(EmptyArrayTolerantConverter<BasketLinks>))]
-            public BasketLinks links = new BasketLinks();
-        }
-
-        [Serializable]
-        public class BasketAuthLink
-        {
-            public string name = string.Empty;
-            public string url = string.Empty;
-        }
-
-        [Serializable]
-        public class BasketCoupon
-        {
-            public string coupon_code;
-
-            public BasketCoupon(string couponCode)
-            {
-                coupon_code = couponCode;
-            }
-        }
-
-        [Serializable]
-        public class BasketGiftCard
-        {
-            public string card_number = string.Empty;
-        }
-
-        [Serializable]
-        public class BasketLinks
-        {
-            public string payment = string.Empty;
-            public string checkout = string.Empty;
-        }
-
-        [Serializable]
-        public class BasketPackage
-        {
-            public int id = -1;
-            public string name = string.Empty;
-            public string description = string.Empty;
-            public InnerPackageMeta in_basket = new InnerPackageMeta();
-        }
-
-        [Serializable]
-        public class BasketRevenueShare
-        {
-            public string wallet_ref = string.Empty;
-            public float amount = -1.0f;
-            public int gateway_fee_percent = -1;
-        }
-
-    #nullable enable
-        [Serializable]
-        public class Category
-        {
-            public int id = -1;
-            public string name = string.Empty;
-            public string slug = string.Empty;
-            public string description = string.Empty;
-            public PackageCategory? parent = null;
-            public int order = -1;
-            public string display_type = string.Empty;
-            public bool tiered = false;
-            public List<Package> packages = new List<Package>();
-            public Tier? active_tier = null;
-        }
-
-    #nullable enable
-        [Serializable]
-        public class CreateBasketPayload
-        {
-            public string? email;
-            public string? username;
-            public string? cancel_url;
-            public string? complete_url;
-            public Dictionary<string, string> custom = new Dictionary<string, string>();
-            public bool complete_auto_redirect;
-
-            public CreateBasketPayload(string? email = null, string? username = null, string? cancelUrl = null,
-                string? completeUrl = null, Dictionary<string, string>? custom = null, bool completeAutoRedirect = true)
-            {
-                this.email = email;
-                this.username = username;
-                cancel_url = cancelUrl;
-                complete_url = completeUrl;
-                this.custom = custom ?? new Dictionary<string, string>();
-                complete_auto_redirect = completeAutoRedirect;
-            }
-        }
-
-        [Serializable]
-        public class CreatorCode
-        {
-            public string code;
-
-            public CreatorCode(string c)
-            {
-                code = c;
-            }
-        }
-
-        public class EmptyArrayTolerantConverter<T> : JsonConverter where T : new()
-        {
-            public override bool CanConvert(Type objectType) => objectType == typeof(T);
-
-            public override bool CanWrite => false;
-
-            public override object ReadJson(JsonReader reader, Type objectType, object existingValue,
-                JsonSerializer serializer)
-            {
-                if (reader.TokenType == JsonToken.StartArray)
-                {
-                    reader.Skip();
-                    return new T();
-                }
-                if (reader.TokenType == JsonToken.Null) return new T();
-
-                var value = new T();
-                serializer.Populate(reader, value);
-                return value;
-            }
-
-            public override void WriteJson(JsonWriter writer, object value, JsonSerializer serializer)
-                => throw new NotImplementedException();
-        }
-
-        [Serializable]
-        public class GiftCard
-        {
-            public string card_number;
-
-            public GiftCard(string cardNumber)
-            {
-                card_number = cardNumber;
-            }
-        }
-
-        [Serializable]
-        public class InnerPackageMeta
-        {
-            public int quantity = -1;
-            public float price = -1.0f;
-            public string gift_username_id = string.Empty;
-            public string gift_username = string.Empty;
-            public string gift_image = string.Empty;
-        }
-
-        [Serializable]
-        public class Package
-        {
-            public int id;
-            public string name = string.Empty;
-            public string description = string.Empty;
-            public string image = string.Empty;
-            public string type = string.Empty;
-            public PackageCategory category = new PackageCategory();
-            public float base_price;
-            public float sales_tax;
-            public float total_price;
-            public string currency = string.Empty;
-            public float prorate_price;
-            public float discount;
-            public bool disable_quantity;
-            public bool disable_gifting;
-            public string created_at = string.Empty;
-            public string updated_at = string.Empty;
-            public int order = -1;
-            public List<PackageVariable> variables = new List<PackageVariable>();
-        }
-
-        [Serializable]
-        public class PackageCategory
-        {
-            public int id;
-            public string name;
-        }
-
-        [Serializable]
-        public class PackageQuantityPayload
-        {
-            public int quantity;
-
-            public PackageQuantityPayload(int qty)
-            {
-                quantity = qty;
-            }
-        }
-
-        [Serializable]
-        public class PackageRemovePayload
-        {
-            public int package_id;
-
-            public PackageRemovePayload(int packageId)
-            {
-                package_id = packageId;
-            }
-        }
-
-        [Serializable]
-        public class PackageVariable
-        {
-            public int id = -1;
-            public string identifier = string.Empty;
-            public string description = string.Empty;
-            public int min_length;
-            public int max_length;
-            public string type = string.Empty;
-            public bool allow_colors;
-            public List<PackageVariableOption> options = new List<PackageVariableOption>();
-        }
-
-        [Serializable]
-        public class PackageVariableOption
-        {
-            public int id = -1;
-            public string name = string.Empty;
-            public string value = string.Empty;
-            public double price;
-            public double percentage;
-        }
-
-    #nullable enable
-        [Serializable]
-        public class Tier
-        {
-            public int id;
-            public string created_at = string.Empty;
-            public long username_id = -1L;
-            public Package package = new Package();
-            public bool active = false;
-            public string recurring_payment_reference = string.Empty;
-            public string next_payment_date = string.Empty;
-            public TierStatus status = new TierStatus();
-            public Package? pending_downgrade_package;
-        }
-
-        [Serializable]
-        public class TierStatus
-        {
-            public int id = -1;
-            public string status = string.Empty;
-        }
-
-        [Serializable]
-        public class TierUpgradeResponse
-        {
-            public bool success = false;
-            public string message = string.Empty;
-        }
-
-        [Serializable]
-        public class UpdateTierPayload
-        {
-            public int package_id;
-
-            public UpdateTierPayload(int packageId)
-            {
-                package_id = packageId;
-            }
-        }
-
-        [Serializable]
-        public class Webstore
-        {
-            public uint id;
-            public string description = string.Empty;
-            public string name = string.Empty;
-            public string webstore_url = string.Empty;
-            public string currency = string.Empty;
-            public string lang = string.Empty;
-            public string logo = string.Empty;
-            public string platform_type = string.Empty;
-            public string platform_type_id = string.Empty;
-            public DateTime created_at = DateTime.MinValue;
-        }
-
-        [Serializable]
-        public class WrappedBasket
-        {
-            public Basket data = new Basket();
-        }
-
-        [Serializable]
-        public class WrappedBasketLinks
-        {
-            public List<BasketAuthLink> data = new List<BasketAuthLink>();
-        }
-
-        [Serializable]
-        public class WrappedBasketPackages
-        {
-            public List<BasketPackage> data = new List<BasketPackage>();
-        }
-
-        [Serializable]
-        public class WrappedCategories
-        {
-            public List<Category> data = new List<Category>();
-        }
-
-        [Serializable]
-        public class WrappedCategory
-        {
-            public Category data = new Category();
-        }
-
-        [Serializable]
-        public class WrappedPackage
-        {
-            public Package data = new Package();
-        }
-
-        [Serializable]
-        public class WrappedPackages
-        {
-            public List<Package> data = new List<Package>();
-        }
-}
-
-namespace Tebex.Plugin
-{
-        [Serializable]
-        public class Account
-        {
-            public int id;
-            public string domain = string.Empty;
-            public string name = string.Empty;
-            public Currency currency = new Currency();
-            public bool online_mode;
-            public string game_type = string.Empty;
-            public bool log_events;
-            public string public_token;
-        }
-
-        [Serializable]
-        public class ActivePackage
-        {
-            public string txn_id = string.Empty;
-            public DateTime date;
-            public int quantity;
-            public PackageInfo package = new PackageInfo();
-        }
-
-    #nullable enable
-        [Serializable]
-        public class Ban
-        {
-            public int id;
-            public DateTime time;
-            public string ip = string.Empty;
-            public string? payment_email;
-            public string reason = string.Empty;
-            public BanUserInfo user = new BanUserInfo();
-        }
-
-        [Serializable]
-        public class BanUserInfo
-        {
-            public string ign = string.Empty;
-            public string uuid = string.Empty;
-        }
-
-    #nullable enable
-        [Serializable]
-        public class Category
-        {
-            public int id;
-            public int order;
-            public string name = string.Empty;
-            public bool only_subcategories;
-            public List<Category> subcategories = new List<Category>();
-            public List<Package> packages = new List<Package>();
-            public object? gui_item;
-        }
-
-        [Serializable]
-        public class CheckoutResponse
-        {
-            public string url = string.Empty;
-            public string expires = string.Empty;
-            public string ident = string.Empty;
-        }
-
-        [Serializable]
-        public class Command
-        {
-            public int id;
-            [JsonProperty("command")]
-            public string command_to_run = string.Empty;
-            public long payment;
-            [JsonProperty("package")]
-            public long package_ref;
-            public CommandConditions conditions = new CommandConditions();
-            public PlayerInfo player = new PlayerInfo();
-        }
-
-        [Serializable]
-        public class CommandConditions
-        {
-            public int delay;
-            public int slots;
-        }
-
-        [Serializable]
-        public class CommandQueueMeta
-        {
-            public bool execute_offline;
-            public int next_check;
-            public bool more;
-        }
-
-        [Serializable]
-        public class CommandQueueResponse
-        {
-            public CommandQueueMeta meta = new CommandQueueMeta();
-            public List<DuePlayer> players = new List<DuePlayer>();
-        }
-
-    #nullable enable
-        [Serializable]
-        public class CommunityGoal
-        {
-            public int id;
-            public DateTime created_at;
-            public DateTime updated_at;
-            public int account;
-            public string name = string.Empty;
-            public string description = string.Empty;
-            public string image = string.Empty;
-            public double target;
-            public double current;
-            public int repeatable;
-            public DateTime? last_achieved;
-            public int times_achieved;
-            public string status = string.Empty;
-            public int sale;
-        }
-
-        [Serializable]
-        public class Coupon
-        {
-            public int id;
-            public string code = string.Empty;
-            public PromotionEffectiveListings effective = new PromotionEffectiveListings();
-            public PromotionDiscount discount = new PromotionDiscount();
-            public CouponExpiry expire = new CouponExpiry();
-            public string basket_type = string.Empty;
-            public DateTime start_date;
-            public int user_limit;
-            public int minimum;
-            public string username = string.Empty;
-            public string note = string.Empty;
-        }
-
-    #nullable enable
-        [Serializable]
-        public class CouponExpiry
-        {
-            public bool redeem_unlimited;
-            public bool expire_never;
-            public int limit;
-            public DateTime? date;
-        }
-
-        [Serializable]
-        public class CouponPage
-        {
-            public CouponPagination pagination = new CouponPagination();
-            public List<Coupon> data = new List<Coupon>();
-        }
-
-    #nullable enable
-        [Serializable]
-        public class CouponPagination
-        {
-            public int total_results;
-            public int current_page;
-            public int last_page;
-            public string? previous;
-            public string? next;
-        }
-
-        [Serializable]
-        public class CreateBanPayload
-        {
-            public string reason = string.Empty;
-            public string ip = string.Empty;
-            public string user = string.Empty;
-        }
-
-        [Serializable]
-        public class CreateCheckoutPayload
-        {
-            public int package_id;
-            public string username = string.Empty;
-        }
-
-        [Serializable]
-        public class CreateGiftCardPayload
-        {
-            public DateTime expires_at;
-            public string note = string.Empty;
-            public double amount;
-        }
-
-        [Serializable]
-        public class Currency
-        {
-            public string iso4217 = string.Empty;
-            public string symbol = string.Empty;
-        }
-
-        [Serializable]
-        public class CustomerPackagePurchaseRecord
-        {
-            public string transaction_id = string.Empty;
-            public DateTime date;
-            public int quantity;
-            public PurchaseRecordPackageInfo purchase_record_package = new PurchaseRecordPackageInfo();
-        }
-
-        [Serializable]
-        public class DeleteCommandsPayload
-        {
-            public int[] ids = Array.Empty<int>();
-        }
-
-        [Serializable]
-        public class DuePlayer
-        {
-            public int id;
-            public string name = string.Empty;
-            public string uuid = string.Empty;
-        }
-
-        [Serializable]
-        public class GatewayInfo
-        {
-            public int id;
-            public string name = string.Empty;
-        }
-
-    #nullable enable
-        [Serializable]
-        public class GiftCard
-        {
-            public int id;
-            public string code = string.Empty;
-            public GiftCardBalance balance = new GiftCardBalance();
-            public string note = string.Empty;
-            public bool voided;
-            public DateTime created_at;
-            public DateTime? expires_at;
-        }
-
-        [Serializable]
-        public class GiftCardBalance
-        {
-            public double starting = -1.0d;
-            public double remaining = -1.0d;
-            public string currency = string.Empty;
-        }
-
-        [Serializable]
-        public class JoinEvent
-        {
-            public string username_id;
-            public string event_type;
-            public DateTime event_date;
-            public string ip;
-
-            public JoinEvent(string usernameId, string eventType, string ipAddress)
-            {
-                username_id = usernameId;
-                event_type = eventType;
-                event_date = DateTime.UtcNow;
-                ip = ipAddress;
-            }
-        }
-
-        [Serializable]
-        public class ListingsResponse
-        {
-            public List<Category> categories = new List<Category>();
-        }
-
-        [Serializable]
-        public class NoteInfo
-        {
-            public string created_at = string.Empty;
-            public string note = string.Empty;
-        }
-
-        [Serializable]
-        public class OfflineCommandsMeta
-        {
-            public bool limited;
-        }
-
-        [Serializable]
-        public class OfflineCommandsResponse
-        {
-            public OfflineCommandsMeta meta = new OfflineCommandsMeta();
-            public List<Command> commands = new List<Command>();
-        }
-
-        [Serializable]
-        public class OnlineCommandPlayerMeta
-        {
-            public string avatar = string.Empty;
-            public string avatar_full = string.Empty;
-            public string steam_id = string.Empty;
-        }
-
-        [Serializable]
-        public class OnlineCommandsPlayer
-        {
-            public string id = string.Empty;
-            public string username = string.Empty;
-            public OnlineCommandPlayerMeta meta = new OnlineCommandPlayerMeta();
-        }
-
-        [Serializable]
-        public class OnlineCommandsResponse
-        {
-            public OnlineCommandsPlayer player = new OnlineCommandsPlayer();
-            public List<Command> commands = new List<Command>();
-        }
-
-    #nullable enable
-        [Serializable]
-        public class Package
-        {
-            public int id;
-            public string name = string.Empty;
-            public int order = -1;
-            public string image = string.Empty;
-            public double price = -1.0d;
-            public PackageSaleData? sale;
-            public int expiry_length;
-            public string expiry_period = string.Empty;
-            public string type = string.Empty;
-            public Category category = new Category();
-            public int global_limit;
-            public string global_limit_period = string.Empty;
-            public int user_limit;
-            public string user_limit_period = string.Empty;
-            public List<Server>? servers;
-            public List<object>? required_packages;
-            public bool require_any;
-            public bool create_giftcard;
-            public string show_until = string.Empty;
-            public string gui_item = string.Empty;
-            public bool disabled;
-            public bool disable_quantity;
-            public bool custom_price;
-            public bool choose_server;
-            public bool limit_expires;
-            public bool inherit_commands;
-            public bool variable_giftcard;
-            public string description = string.Empty;
-
-            public string GetFriendlyPayFrequency()
-            {
-                switch (type)
-                {
-                    case "single": return "One-Time";
-                    case "subscription": return $"Each {expiry_length} {expiry_period}";
-                    default: return "???";
-                }
-            }
-        }
-
-        [Serializable]
-        public class PackageInfo
-        {
-            public int id;
-            public string name = string.Empty;
-        }
-
-        [Serializable]
-        public class PackageSaleData
-        {
-            public bool active = false;
-            public double discount = -1.0d;
-        }
-
-    #nullable enable
-        [Serializable]
-        public class PaginatedPaymentInfo
-        {
-            public int total = -1;
-            public int per_page = -1;
-            public int current_page = -1;
-            public int last_page = -1;
-            public string? next_page_url = string.Empty;
-            public string? previous_page_url = string.Empty;
-            public int from = -1;
-            public int to = -1;
-            public List<PaymentDetails> data = new List<PaymentDetails>();
-        }
-
-        [Serializable]
-        public class PaidPlayer
-        {
-            public int id;
-            public string name = string.Empty;
-            public string uuid = string.Empty;
-        }
-
-    #nullable enable
-        [Serializable]
-        public class PaymentDetails
-        {
-            public int id;
-            public double amount;
-            public DateTime date;
-            public Currency currency = new Currency();
-            public GatewayInfo gateway = new GatewayInfo();
-            public string status = string.Empty;
-            public string email = string.Empty;
-            public PaidPlayer player = new PaidPlayer();
-            public List<PackageInfo> packages = new List<PackageInfo>();
-            public List<NoteInfo> notes = new List<NoteInfo>();
-            public string? creator_code;
-        }
-
-        [Serializable]
-        public class PlayerInfo
-        {
-            [JsonIgnore]
-            public string id = string.Empty;
-            [JsonProperty("name")]
-            public string username = string.Empty;
-            public OnlineCommandPlayerMeta meta = new OnlineCommandPlayerMeta();
-            public string uuid = string.Empty;
-            [JsonProperty("id")]
-            public int plugin_username_id;
-        }
-
-        [Serializable]
-        public class PlayerPaymentInfo
-        {
-            public string transaction_id = string.Empty;
-            public long time;
-            public double price;
-            public string currency = string.Empty;
-            public string status = string.Empty;
-        }
-
-        [Serializable]
-        public class PromotionDiscount
-        {
-            public string type = string.Empty;
-            public double percentage;
-            public double value;
-        }
-
-        [Serializable]
-        public class PromotionEffectiveListings
-        {
-            public string type = string.Empty;
-            public List<int> packages = new List<int>();
-            public List<int> categories = new List<int>();
-        }
-
-        [Serializable]
-        public class PurchaseRecordPackageInfo
-        {
-            public int id;
-            public string name = string.Empty;
-        }
-
-        [Serializable]
-        public class Sale
-        {
-            public int id;
-            public string name = string.Empty;
-            public PromotionEffectiveListings effective = new PromotionEffectiveListings();
-            public PromotionDiscount discount = new PromotionDiscount();
-            public int start;
-            public int expire;
-            public int order;
-        }
-
-        [Serializable]
-        public class Server
-        {
-            public int id;
-            public string name = string.Empty;
-        }
-
-        [Serializable]
-        public class Store
-        {
-            public Account account = new Account();
-            public Server server = new Server();
-        }
-
-        [Serializable]
-        public class TopUpGiftCardPayload
-        {
-            public string amount = string.Empty;
-        }
-
-        [Serializable]
-        public class UserLookupResponse
-        {
-            public PlayerInfo player = new PlayerInfo();
-            public int ban_count;
-            public int chargeback_rate;
-            public List<PlayerPaymentInfo> payments = new List<PlayerPaymentInfo>();
-            public object[] purchase_totals = Array.Empty<object>();
-        }
-
-        [Serializable]
-        public class WrappedBan
-        {
-            public Ban data = new Ban();
-        }
-
-        [Serializable]
-        public class WrappedBans
-        {
-            public List<Ban> data = new List<Ban>();
-        }
-
-        [Serializable]
-        public class WrappedCoupon
-        {
-            public Coupon data = new Coupon();
-        }
-
-        [Serializable]
-        public class WrappedGiftCard
-        {
-            public GiftCard data = new GiftCard();
-        }
-
-        [Serializable]
-        public class WrappedGiftCards
-        {
-            public List<GiftCard> data = new List<GiftCard>();
-        }
-
-        [Serializable]
-        public class WrappedSales
-        {
-            public List<Sale> data = new List<Sale>();
-        }
-}
-
 namespace Oxide.Plugins
 {
-    [Info("TebexPlugin", "Tebex", "3.0.0")]
+    [Info("TebexPlugin", "Tebex", "3.1.0")]
     [Description("Official Tebex monetization plugin for Rust")]
     public class TebexPlugin : RustPlugin
     {
@@ -1743,8 +119,11 @@ namespace Oxide.Plugins
             [JsonProperty("buy_command")]
             public string BuyCommand { get; set; } = "buy";
 
+            [JsonProperty("subs_command")]
+            public string SubsCommand { get; set; } = "subs";
+
             [JsonProperty("disable_ui")]
-            public bool DisableUi { get; set; } = false;
+            public bool DisableUi { get; set; } = true;
 
             [JsonProperty("admin_command")]
             public string AdminCommand { get; set; } = "tebex";
@@ -1757,6 +136,9 @@ namespace Oxide.Plugins
 
             [JsonProperty("enable_basket")]
             public bool EnableBasket { get; set; } = true;
+
+            [JsonProperty("check_for_updates")]
+            public bool CheckForUpdates { get; set; } = true;
 
             [JsonProperty("track_permissions")]
             public bool TrackPermissions { get; set; } = true;
@@ -1828,6 +210,7 @@ namespace Oxide.Plugins
 
             AddCovalenceCommand(_config.AdminCommand, nameof(CmdTebex));
             AddCovalenceCommand(_config.BuyCommand, nameof(CmdBuy));
+            AddCovalenceCommand(_config.SubsCommand, nameof(CmdSubs));
 
             LoadPlayerLookup();
             LoadPermissionLedger();
@@ -1838,6 +221,8 @@ namespace Oxide.Plugins
         private void OnServerInitialized()
         {
             LoadEmbeddedImages();
+
+            CheckForUpdate();
 
             var key = ResolveSecret();
             if (string.IsNullOrEmpty(key))
@@ -1861,6 +246,47 @@ namespace Oxide.Plugins
                 RefreshListing();
                 FetchCommunityGoals();
             });
+        }
+
+        private void CheckForUpdate()
+        {
+            if (!_config.CheckForUpdates) return;
+
+            ApiRequest("/versions/oxide", RequestMethod.GET, null, (code, response) =>
+            {
+                if (code != 200 || string.IsNullOrEmpty(response))
+                {
+                    if (_config.Debug) PrintWarning($"[Tebex] update check failed: HTTP {code}");
+                    return;
+                }
+
+                try
+                {
+                    var latest = JsonConvert.DeserializeObject<Tebex.Plugin.PluginVersion>(response)?.version;
+                    if (!System.Version.TryParse(latest ?? "", out var latestVersion)
+                        || !System.Version.TryParse(Version.ToString(), out var currentVersion))
+                    {
+                        if (_config.Debug) PrintWarning($"[Tebex] update check returned an unrecognized version: {latest}");
+                        return;
+                    }
+
+                    if (latestVersion > currentVersion)
+                    {
+                        PrintWarning($"A new version of the Tebex plugin is available: {latest} (you are running {Version}). "
+                            + "Download it from https://github.com/tebexio/Tebex-Rust/releases");
+                    }
+                    else if (_config.Debug)
+                    {
+                        Puts(currentVersion > latestVersion
+                            ? $"[Tebex] running {Version}, which is newer than the latest release ({latest})."
+                            : $"[Tebex] plugin is up to date ({Version}).");
+                    }
+                }
+                catch (Exception e)
+                {
+                    if (_config.Debug) PrintWarning($"[Tebex] update check failed: {e.Message}");
+                }
+            }, requireSecret: false);
         }
 
         private void Unload()
@@ -2093,6 +519,22 @@ namespace Oxide.Plugins
             OpenStoreForPlayer(player, basePlayer);
         });
 
+        private void CmdSubs(IPlayer player, string command, string[] args) => MeasureHook("CmdSubs", () =>
+        {
+            if (player.IsServer)
+            {
+                player.Reply($"The /{_config.SubsCommand} command must be run as a player.");
+                return;
+            }
+            const string portalUrl = "https://portal.tebex.io";
+            player.Reply($"You may log in and check your active subscriptions here: {portalUrl}");
+            if (player.Object is BasePlayer bp)
+            {
+                bp.ConsoleMessage(portalUrl);
+                bp.ChatMessage("The link has also been sent to your F1 console. Click the timestamp to copy it.");
+            }
+        });
+
         private void OpenStoreForPlayer(IPlayer player, BasePlayer basePlayer)
         {
             var uiEnabled = !_config.DisableUi;
@@ -2214,7 +656,7 @@ namespace Oxide.Plugins
                 player.Reply("Checkout requires a player context. Use sendlink instead.");
                 return;
             }
-            CreateCheckout(packageId, player.Name, (ok, url, err) =>
+            CreateCheckout(packageId, player.Id, (ok, url, err) =>
             {
                 if (!ok) { player.Reply($"Checkout failed: {err}"); return; }
                 SendCheckoutLink(player, url, packageId);
@@ -2241,7 +683,7 @@ namespace Oxide.Plugins
                 player.Reply($"Player '{args[1]}' not found.");
                 return;
             }
-            CreateCheckout(packageId, target.Name, (ok, url, err) =>
+            CreateCheckout(packageId, target.Id, (ok, url, err) =>
             {
                 if (!ok) { player.Reply($"Checkout failed: {err}"); return; }
                 if (target.IsConnected) SendCheckoutLink(target, url, packageId);
@@ -2550,6 +992,16 @@ namespace Oxide.Plugins
 
         private void SendHttp(RequestMethod method, string url, string body, IDictionary<string, string> headers, float timeoutSeconds, Action<int, string> callback)
         {
+            #if TEBEX_DEV
+            if (url != null && url.Contains("://plugin.tebex.io"))
+            {
+                url = url.Replace("://plugin.tebex.io", "://plugin.dev.tebex.io");
+            }
+            if (url != null && url.Contains("://headless.tebex.io"))
+            {
+                url = url.Replace("://headless.tebex.io", "://headless.dev.tebex.io");
+            }
+            #endif
             DebugHttpRequest(method, url, headers, body);
             var startedAt = UnityEngine.Time.realtimeSinceStartup;
             webrequest.Enqueue(url, body ?? "", (code, response) =>
@@ -2562,7 +1014,7 @@ namespace Oxide.Plugins
                 }
                 catch (Exception e)
                 {
-                    if (url.Contains("https://plugin-logs.tebex.io"))
+                    if (!url.Contains("https://plugin-logs.tebex.io"))
                     {
                         ReportTelemetry("ERROR", $"Callback for {method} {url} threw: {e.Message}", e.StackTrace);
                         PrintError($"Tebex callback error: {e.Message}");
@@ -2678,6 +1130,13 @@ namespace Oxide.Plugins
                 try
                 {
                     var info = JsonConvert.DeserializeObject<Tebex.Plugin.Store>(response, JsonSettings);
+
+                    if (!info.account.game_type.ToLower().Equals("rust"))
+                    {
+                        callback(false, info, "Invalid game type: that is not a Rust game server key");
+                        return;
+                    }
+
                     _publicToken = info.account.public_token;
                     callback(true, info, null);
                 }
@@ -2688,9 +1147,9 @@ namespace Oxide.Plugins
             });
         }
 
-        private void PluginCheckout(int packageId, string username, Action<bool, Tebex.Plugin.CheckoutResponse, string> callback)
+        private void PluginCheckout(int packageId, string usernameId, Action<bool, Tebex.Plugin.CheckoutResponse, string> callback)
         {
-            var payload = new Tebex.Plugin.CreateCheckoutPayload { package_id = packageId, username = username };
+            var payload = new Tebex.Plugin.CreateCheckoutPayload { package_id = packageId, username_id = usernameId };
             var body = JsonConvert.SerializeObject(payload, JsonSettings);
             ApiRequest("/checkout", RequestMethod.POST, body, (code, response) =>
             {
@@ -2713,9 +1172,9 @@ namespace Oxide.Plugins
             });
         }
 
-        private void CreateCheckout(int packageId, string username, Action<bool, string, string> callback)
+        private void CreateCheckout(int packageId, string usernameId, Action<bool, string, string> callback)
         {
-            PluginCheckout(packageId, username, (ok, resp, err) =>
+            PluginCheckout(packageId, usernameId, (ok, resp, err) =>
             {
                 if (!ok) { callback?.Invoke(false, null, err); return; }
                 callback?.Invoke(true, resp.url, null);
@@ -2797,7 +1256,7 @@ namespace Oxide.Plugins
             }
             if (!string.IsNullOrEmpty(state.BasketIdent)) { cb?.Invoke(true, null); return; }
 
-            PluginCheckout(seedPackageId, player.displayName, (ok, resp, err) =>
+            PluginCheckout(seedPackageId, player.UserIDString, (ok, resp, err) =>
             {
                 if (!ok) { cb?.Invoke(false, err); return; }
                 state.BasketIdent = resp.ident;
@@ -2824,7 +1283,8 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                var body = JsonConvert.SerializeObject(new Tebex.Headless.AddPackagePayload(packageId), JsonSettings);
+                var pkgType = AllPackages().FirstOrDefault(p => p.id == packageId)?.type;
+                var body = JsonConvert.SerializeObject(new Tebex.Headless.AddPackagePayload(packageId, type: string.IsNullOrEmpty(pkgType) ? null : pkgType), JsonSettings);
                 var path = $"baskets/{Uri.EscapeDataString(state.BasketIdent)}/packages";
                 HeadlessRequest(RequestMethod.POST, path, body, (code, response) =>
                 {
@@ -3342,7 +1802,7 @@ namespace Oxide.Plugins
             return changed;
         }
 
-        private static string BuildReplayCommand(PermissionLedgerRecord rec, PermissionLedgerEntry e)
+        private static string BuildReplayCommand(PermissionLedgerRecord rec, PermissionLedgerEntry e, bool carbon = false)
         {
             if (rec == null || e == null) return string.Empty;
 
@@ -3354,9 +1814,22 @@ namespace Oxide.Plugins
             if (id.Length == 0 || string.IsNullOrWhiteSpace(e.Value)) return string.Empty;
 
             var arg = QuoteIfNeeded(e.Value);
+            var prefix = carbon ? "c." : "oxide.";
             return string.Equals(e.Type, "group", StringComparison.OrdinalIgnoreCase)
-                ? $"oxide.usergroup add {id} {arg}"
-                : $"oxide.grant user {id} {arg}";
+                ? $"{prefix}usergroup add {id} {arg}"
+                : $"{prefix}grant user {id} {arg}";
+        }
+
+        private static bool IsCarbon
+        {
+            get
+            {
+#if CARBON
+                return true;
+#else
+                return false;
+#endif
+            }
         }
 
         private static string QuoteIfNeeded(string arg)
@@ -3365,13 +1838,13 @@ namespace Oxide.Plugins
             return arg.IndexOf(' ') >= 0 || arg.IndexOf('\t') >= 0 ? $"\"{arg}\"" : arg;
         }
 
-        private static List<string> BuildReplayCommands(PermissionLedgerRecord rec)
+        private static List<string> BuildReplayCommands(PermissionLedgerRecord rec, bool carbon = false)
         {
             var commands = new List<string>();
             if (rec?.Entries == null) return commands;
             foreach (var e in rec.Entries)
             {
-                var line = BuildReplayCommand(rec, e);
+                var line = BuildReplayCommand(rec, e, carbon);
                 if (!string.IsNullOrWhiteSpace(line)) commands.Add(line);
             }
             return commands;
@@ -3432,6 +1905,7 @@ namespace Oxide.Plugins
 
             var verb = t[0].ToLowerInvariant();
             if (verb.StartsWith("o.")) verb = "oxide." + verb.Substring(2);
+            else if (verb.StartsWith("c.")) verb = "oxide." + verb.Substring(2);
 
             switch (verb)
             {
@@ -3485,7 +1959,8 @@ namespace Oxide.Plugins
             var c = command.TrimStart().ToLowerInvariant();
             return c.StartsWith("oxide.grant") || c.StartsWith("o.grant")
                 || c.StartsWith("oxide.revoke") || c.StartsWith("o.revoke")
-                || c.StartsWith("oxide.usergroup") || c.StartsWith("o.usergroup");
+                || c.StartsWith("oxide.usergroup") || c.StartsWith("o.usergroup")
+                || c.StartsWith("c.grant") || c.StartsWith("c.revoke") || c.StartsWith("c.usergroup");
         }
 
         private static CustomPermissionCommand? MatchCustomCommand(
@@ -3537,7 +2012,7 @@ namespace Oxide.Plugins
 
         private int ReplayLedger(PermissionLedgerRecord rec)
         {
-            var commands = BuildReplayCommands(rec);
+            var commands = BuildReplayCommands(rec, IsCarbon);
             foreach (var line in commands) ExecuteServerCommand(line);
             return commands.Count;
         }
@@ -4985,7 +3460,7 @@ namespace Oxide.Plugins
 
         private const int HealthPillCount = 3;
 
-        private static readonly (string Key, string Title, int Col, int Band, int Rows, string[]? Cols)[] HealthCards =
+        private static readonly (string Key, string Title, int Col, int Band, int Rows, string[] Cols)[] HealthCards =
         {
             ("Timers",    "TIMERS",           0, 0, 4,                 new[] { "EVERY", "LAST", "NEXT" }),
             ("Hooks",     "HOOKS",            1, 0, DebugHookRowCount, new[] { "COUNT", "AVG", "MAX" }),
@@ -5014,7 +3489,7 @@ namespace Oxide.Plugins
         }
 
         private void DrawHealthCard(CuiElementContainer elements,
-            (string Key, string Title, int Col, int Band, int Rows, string[]? Cols) spec)
+            (string Key, string Title, int Col, int Band, int Rows, string[] Cols) spec)
         {
             var name = HealthCardName(spec.Key);
             float x0 = spec.Col == 0 ? HcCol0X0 : HcCol1X0;
@@ -5221,6 +3696,7 @@ namespace Oxide.Plugins
             ("QUEUE & DELIVERY", "{admin} replay <user|all>",     "Re-apply tracked permissions after a wipe"),
 
             ("STORE & CHECKOUT", "{buy}",                         "Open the in-game store"),
+            ("STORE & CHECKOUT", "{subs}",                        "Get a link to manage your active subscriptions"),
             ("STORE & CHECKOUT", "{admin} checkout <pkgId>",      "Get an instant checkout link for yourself"),
             ("STORE & CHECKOUT", "{admin} sendlink <pkg> <user>", "Send a checkout link to a player"),
             ("STORE & CHECKOUT", "{admin} goals",                 "Show community goal progress"),
@@ -5236,7 +3712,8 @@ namespace Oxide.Plugins
 
         private string FormatCommandSyntax(string syntax)
             => syntax.Replace("{admin}", "/" + _config.AdminCommand)
-                     .Replace("{buy}", "/" + _config.BuyCommand);
+                     .Replace("{buy}", "/" + _config.BuyCommand)
+                     .Replace("{subs}", "/" + _config.SubsCommand);
 
         private static List<(string Name, int Count)> CommandReferenceSections()
         {
@@ -5895,7 +4372,7 @@ namespace Oxide.Plugins
                     if (arg.Args.Length >= 2 && int.TryParse(arg.Args[1], out var bpid))
                     {
                         DestroyUi(player);
-                        CreateCheckout(bpid, player.displayName, (ok, url, err) =>
+                        CreateCheckout(bpid, player.UserIDString, (ok, url, err) =>
                         {
                             var ipInner = player.IPlayer;
                             if (!ok) { ipInner?.Reply($"Checkout failed: {err}"); return; }
@@ -5983,6 +4460,11 @@ namespace Oxide.Plugins
             Parse("usergroup add", "oxide.usergroup add 76561198000000001 vips", true, true, "group", "vips");
             Parse("usergroup remove", "oxide.usergroup remove 76561198000000001 vips", true, false, "group", "vips");
             Parse("o.usergroup alias", "o.usergroup add 76561198000000001 vips", true, true, "group", "vips");
+            Parse("carbon c.grant", "c.grant user 76561198000000001 vip", true, true, "permission", "vip");
+            Parse("carbon c.revoke", "c.revoke user 76561198000000001 vip", true, false, "permission", "vip");
+            Parse("carbon c.usergroup add", "c.usergroup add 76561198000000001 vips", true, true, "group", "vips");
+            Parse("carbon c.usergroup remove", "c.usergroup remove 76561198000000001 vips", true, false, "group", "vips");
+            Parse("carbon c.grant group ignored", "c.grant group vips someperm", false);
             Parse("uppercase verb", "OXIDE.GRANT USER 76561198000000001 VIP", true, true, "permission", "VIP");
             Parse("extra whitespace", "  oxide.grant   user   76561198000000001   vip  ", true, true, "permission", "vip");
             Parse("tab separated", "oxide.grant\tuser\t76561198000000001\tvip", true, true, "permission", "vip");
@@ -6002,6 +4484,7 @@ namespace Oxide.Plugins
             Check("tokenizer keeps quoted spaces",
                 TokenizeCommand("a \"b c\" d").Count == 3 && TokenizeCommand("a \"b c\" d")[1] == "b c");
             Check("LooksLikePermissionCommand positive", LooksLikePermissionCommand("oxide.grant user x y"));
+            Check("LooksLikePermissionCommand carbon", LooksLikePermissionCommand("c.grant user x y"));
             Check("LooksLikePermissionCommand negative", !LooksLikePermissionCommand("inventory.giveto x y 1"));
 
             var customConfig = new List<CustomPermissionCommand>
@@ -6102,6 +4585,19 @@ namespace Oxide.Plugins
             });
             Check("replay ignores RawCommand for oxide entries",
                 BuildReplayCommands(renamedRec).SequenceEqual(new[] { $"oxide.grant user {idA} vip" }));
+            var carbonCommands = BuildReplayCommands(replayRec, carbon: true);
+            Check("carbon replay emits one command per replayable entry", carbonCommands.Count == 4,
+                $"got {carbonCommands.Count}: {string.Join(" | ", carbonCommands)}");
+            Check("carbon replay rebuilds permission grant",
+                carbonCommands.Contains($"c.grant user {idA} vip"), string.Join(" | ", carbonCommands));
+            Check("carbon replay rebuilds group add",
+                carbonCommands.Contains($"c.usergroup add {idA} vips"), string.Join(" | ", carbonCommands));
+            Check("carbon replay quotes a group name with spaces",
+                carbonCommands.Contains($"c.usergroup add {idA} \"vip plus\""), string.Join(" | ", carbonCommands));
+            Check("carbon replay leaves custom commands untouched",
+                carbonCommands.Contains($"addvip {idA}"), string.Join(" | ", carbonCommands));
+            Check("carbon replay ignores an oxide RawCommand",
+                BuildReplayCommands(renamedRec, carbon: true).SequenceEqual(new[] { $"c.grant user {idA} vip" }));
             Check("replay of an empty record emits nothing",
                 BuildReplayCommands(new PermissionLedgerRecord { Uuid = idA }).Count == 0);
             Check("replay of a null record emits nothing", BuildReplayCommands(null!).Count == 0);
@@ -6147,6 +4643,33 @@ namespace Oxide.Plugins
             Check("lookup miss returns null", FindLedgerRecord(lookup, "Nobody") == null);
             Check("lookup empty arg returns null", FindLedgerRecord(lookup, "") == null);
             Check("lookup null ledger returns null", FindLedgerRecord(null!, idA) == null);
+
+            Check("br becomes a newline",
+                StripHtml("Line one<br>Line two") == "Line one\nLine two");
+            Check("br self-closing becomes a newline",
+                StripHtml("Line one<br/>Line two") == "Line one\nLine two");
+            Check("closing p becomes a newline",
+                StripHtml("<p>First para</p><p>Second para</p>") == "First para\nSecond para");
+            Check("li becomes a bullet on its own line",
+                StripHtml("<ul><li>One</li><li>Two</li></ul>") == "• One\n• Two");
+            Check("other tags are dropped without a trace",
+                StripHtml("<strong>Bold</strong> and <em>italic</em>") == "Bold and italic");
+            Check("html entities are decoded",
+                StripHtml("Tom &amp; Jerry&nbsp;&mdash; 50% off") == "Tom & Jerry — 50% off");
+            Check("runs of blank lines collapse to one",
+                StripHtml("<p>A</p><br><br><br><p>B</p>") == "A\n\nB");
+            Check("leading and trailing whitespace is trimmed",
+                StripHtml("<p>Padded</p>\n\n") == "Padded");
+            Check("plain text with no markup is unchanged",
+                StripHtml("Just plain text.") == "Just plain text.");
+            Check("empty and null input return empty string",
+                StripHtml("") == "" && StripHtml(null!) == "");
+
+            Check("payload without a type omits the field",
+                !JsonConvert.SerializeObject(new Tebex.Headless.AddPackagePayload(123), JsonSettings).Contains("\"type\""));
+            Check("payload with a type includes it",
+                JsonConvert.SerializeObject(new Tebex.Headless.AddPackagePayload(123, type: "subscription"), JsonSettings)
+                    .Contains("\"type\":\"subscription\""));
 
             var total = passed + failures.Count;
             if (failures.Count == 0)
@@ -6202,9 +4725,18 @@ namespace Oxide.Plugins
             return s.Length <= len ? s : s.Substring(0, len) + "…";
         }
 
+        private static readonly Regex BlockTagRegex = new(
+            @"</p\s*>|<br\s*/?>|</div\s*>|</li\s*>|</h[1-6]\s*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex ListItemRegex = new(@"<li\s*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        private static readonly Regex BlankLineRegex = new(@"\n{3,}", RegexOptions.Compiled);
+
         private static string StripHtml(string s)
         {
             if (string.IsNullOrEmpty(s)) return "";
+
+            s = BlockTagRegex.Replace(s, "\n");
+            s = ListItemRegex.Replace(s, "• ");
+
             var sb = new StringBuilder(s.Length);
             bool inTag = false;
             foreach (var c in s)
@@ -6213,9 +4745,1658 @@ namespace Oxide.Plugins
                 if (c == '>') { inTag = false; continue; }
                 if (!inTag) sb.Append(c);
             }
-            return sb.ToString();
+
+            var decoded = WebUtility.HtmlDecode(sb.ToString());
+            decoded = BlankLineRegex.Replace(decoded, "\n\n");
+            return decoded.Trim();
         }
 
         #endregion
     }
+}
+
+namespace Tebex.QR
+{
+    public sealed class QrCode
+    {
+        public byte[] Bytes;
+
+        private QrCode(byte[] bytes) => Bytes = bytes;
+
+        public bool[,] GetModules()
+        {
+            int version = Bytes[0];
+            int size = Bytes[2];
+            var modules = new bool[size, size];
+            int bitIndex = 0;
+            for (int r = 0; r < size; r++)
+            for (int c = 0; c < size; c++)
+            {
+                int byteIndex = 3 + (bitIndex >> 3);
+                int bitInByte = 7 - (bitIndex & 7);
+                bool black = ((Bytes[byteIndex] >> bitInByte) & 1) != 0;
+                modules[r, c] = black;
+                bitIndex++;
+            }
+            return modules;
+        }
+
+        public static QrCode Encode(string content)
+        {
+            if (content == null) throw new ArgumentNullException(nameof(content));
+
+            if (!content.StartsWith("https://"))
+            {
+                throw new ArgumentException("Content must be a web address beginning with https://, got " + content);
+            }
+
+            if (content.Contains("javascript:"))
+            {
+                throw new ArgumentException("Content must not contain Javascript");
+            }
+
+            if (content.Contains("<script>"))
+            {
+                throw new ArgumentException("Content must not contain script tags");
+            }
+
+            if (content.Contains("eval(") || content.Contains("onerror=") || content.Contains("onload=") ||
+                content.Contains("document."))
+            {
+                throw new ArgumentException("Invalid content url");
+            }
+
+            byte[] dataBytes = Encoding.UTF8.GetBytes(content);
+
+            int version = ChooseVersionByteModeL(dataBytes.Length);
+            if (version == 0)
+                throw new ArgumentException("Content too long for versions 1..4 at EC Level L in this basic implementation.");
+
+            int size = 21 + 4 * (version - 1);
+
+            GetV1to4LParams(version, out int dataCodewords, out int eccCodewords, out int totalCodewords);
+
+            var bb = new BitBuffer();
+            bb.AppendBits(0b0100, 4);
+            bb.AppendBits(dataBytes.Length, 8);
+            foreach (byte b in dataBytes) bb.AppendBits(b, 8);
+
+            int totalDataBits = dataCodewords * 8;
+
+            int remaining = totalDataBits - bb.BitLength;
+            if (remaining > 0)
+                bb.AppendBits(0, Math.Min(4, remaining));
+
+            while ((bb.BitLength & 7) != 0) bb.AppendBits(0, 1);
+
+            bool toggle = true;
+            while (bb.BitLength < totalDataBits)
+            {
+                bb.AppendBits(toggle ? 0xEC : 0x11, 8);
+                toggle = !toggle;
+            }
+
+            byte[] dataCw = bb.ToBytes();
+            if (dataCw.Length != dataCodewords)
+                throw new InvalidOperationException("Unexpected data codeword length.");
+
+            byte[] eccCw = ReedSolomon.ComputeECC(dataCw, eccCodewords);
+
+            var allCw = new byte[totalCodewords];
+            Buffer.BlockCopy(dataCw, 0, allCw, 0, dataCw.Length);
+            Buffer.BlockCopy(eccCw, 0, allCw, dataCw.Length, eccCw.Length);
+
+            var modules = new bool[size, size];
+            var isFunction = new bool[size, size];
+
+            DrawFunctionPatterns(version, modules, isFunction);
+
+            PlaceCodewords(modules, isFunction, allCw);
+
+            int bestMask = -1;
+            int bestPenalty = int.MaxValue;
+            bool[,] best = null;
+
+            for (int mask = 0; mask < 8; mask++)
+            {
+                var temp = (bool[,])modules.Clone();
+                ApplyMask(temp, isFunction, mask);
+                WriteFormatInfo(temp, isFunction, ecLevelBits: 0b01, mask);
+                int penalty = PenaltyScore(temp);
+                if (penalty < bestPenalty)
+                {
+                    bestPenalty = penalty;
+                    bestMask = mask;
+                    best = temp;
+                }
+            }
+
+            byte[] packed = PackModules(best);
+            byte[] output = new byte[3 + packed.Length];
+            output[0] = (byte)version;
+            output[1] = 0;
+            output[2] = (byte)size;
+            Buffer.BlockCopy(packed, 0, output, 3, packed.Length);
+
+            return new QrCode(output);
+        }
+
+        public static string Decode(QrCode code)
+        {
+            if (code == null) throw new ArgumentNullException(nameof(code));
+
+            int version = code.Bytes[0];
+            int size = code.Bytes[2];
+            var modules = code.GetModules();
+
+            var isFunction = new bool[size, size];
+            var dummy = new bool[size, size];
+            DrawFunctionPatterns(version, dummy, isFunction);
+
+            int mask = ReadMaskFromFormat(modules);
+
+            ApplyMask(modules, isFunction, mask);
+
+            GetV1to4LParams(version, out int dataCodewords, out int eccCodewords, out int totalCodewords);
+            byte[] allCw = ReadCodewords(modules, isFunction, totalCodewords);
+
+            byte[] dataCw = new byte[dataCodewords];
+            Buffer.BlockCopy(allCw, 0, dataCw, 0, dataCodewords);
+
+            var br = new BitReader(dataCw);
+
+            int mode = br.ReadBits(4);
+            if (mode == 0) return "";
+            if (mode != 0b0100) throw new NotSupportedException("Only Byte mode is supported by this basic decoder.");
+
+            int count = br.ReadBits(8);
+            var payload = new byte[count];
+            for (int i = 0; i < count; i++)
+                payload[i] = (byte)br.ReadBits(8);
+
+            return Encoding.UTF8.GetString(payload);
+        }
+
+        private static int ChooseVersionByteModeL(int byteLen)
+        {
+            if (byteLen <= 17) return 1;
+            if (byteLen <= 32) return 2;
+            if (byteLen <= 53) return 3;
+            if (byteLen <= 78) return 4;
+            return 0;
+        }
+
+        private static void GetV1to4LParams(int version, out int data, out int ecc, out int total)
+        {
+            switch (version)
+            {
+                case 1: data = 19; ecc = 7; total = 26; return;
+                case 2: data = 34; ecc = 10; total = 44; return;
+                case 3: data = 55; ecc = 15; total = 70; return;
+                case 4: data = 80; ecc = 20; total = 100; return;
+                default: throw new NotSupportedException("This basic implementation supports versions 1..4 only.");
+            }
+        }
+
+        private static void DrawFunctionPatterns(int version, bool[,] modules, bool[,] isFunction)
+        {
+            int size = modules.GetLength(0);
+
+            DrawFinder(modules, isFunction, 0, 0);
+            DrawFinder(modules, isFunction, 0, size - 7);
+            DrawFinder(modules, isFunction, size - 7, 0);
+
+            DrawSeparators(isFunction, 0, 0);
+            DrawSeparators(isFunction, 0, size - 7);
+            DrawSeparators(isFunction, size - 7, 0);
+
+            for (int i = 8; i < size - 8; i++)
+            {
+                bool val = (i % 2) == 0;
+                modules[6, i] = val; isFunction[6, i] = true;
+                modules[i, 6] = val; isFunction[i, 6] = true;
+            }
+
+            int darkRow = 4 * version + 9;
+            modules[darkRow, 8] = true;
+            isFunction[darkRow, 8] = true;
+
+            ReserveFormatAreas(isFunction);
+
+            DrawAlignmentPatterns(version, modules, isFunction);
+
+        }
+
+        private static void DrawFinder(bool[,] modules, bool[,] isFunction, int top, int left)
+        {
+            for (int r = 0; r < 7; r++)
+            for (int c = 0; c < 7; c++)
+            {
+                int rr = top + r, cc = left + c;
+                bool on =
+                    (r == 0 || r == 6 || c == 0 || c == 6) ||
+                    (r >= 2 && r <= 4 && c >= 2 && c <= 4);
+
+                modules[rr, cc] = on;
+                isFunction[rr, cc] = true;
+            }
+        }
+
+        private static void DrawSeparators(bool[,] isFunction, int top, int left)
+        {
+            int size = isFunction.GetLength(0);
+
+            for (int i = -1; i <= 7; i++)
+            {
+                SetFunc(isFunction, top - 1, left + i, size);
+                SetFunc(isFunction, top + 7, left + i, size);
+                SetFunc(isFunction, top + i, left - 1, size);
+                SetFunc(isFunction, top + i, left + 7, size);
+            }
+        }
+
+        private static void SetFunc(bool[,] isFunction, int r, int c, int size)
+        {
+            if ((uint)r < (uint)size && (uint)c < (uint)size)
+                isFunction[r, c] = true;
+        }
+
+        private static void ReserveFormatAreas(bool[,] isFunction)
+        {
+            int size = isFunction.GetLength(0);
+
+            for (int i = 0; i < 9; i++)
+            {
+                if (i != 6)
+                {
+                    isFunction[8, i] = true;
+                    isFunction[i, 8] = true;
+                }
+            }
+
+            for (int i = 0; i < 8; i++)
+            {
+                isFunction[8, size - 1 - i] = true;
+                isFunction[size - 1 - i, 8] = true;
+            }
+
+            isFunction[8, 8] = true;
+        }
+
+        private static void DrawAlignmentPatterns(int version, bool[,] modules, bool[,] isFunction)
+        {
+            if (version == 1) return;
+
+            int size = modules.GetLength(0);
+            int center = size - 7;
+
+            DrawAlignment(modules, isFunction, center - 2, center - 2);
+        }
+
+        private static void DrawAlignment(bool[,] modules, bool[,] isFunction, int top, int left)
+        {
+            for (int r = 0; r < 5; r++)
+            for (int c = 0; c < 5; c++)
+            {
+                int rr = top + r, cc = left + c;
+                bool on =
+                    (r == 0 || r == 4 || c == 0 || c == 4) ||
+                    (r == 2 && c == 2);
+
+                modules[rr, cc] = on;
+                isFunction[rr, cc] = true;
+            }
+        }
+
+        private static void PlaceCodewords(bool[,] modules, bool[,] isFunction, byte[] codewords)
+        {
+            int size = modules.GetLength(0);
+
+            int bitIndex = 0;
+            int dir = -1;
+            int col = size - 1;
+
+            while (col > 0)
+            {
+                if (col == 6) col--;
+
+                for (int row = (dir == -1 ? size - 1 : 0);
+                     (dir == -1 ? row >= 0 : row < size);
+                     row += dir)
+                {
+                    for (int c = 0; c < 2; c++)
+                    {
+                        int x = col - c;
+                        if (isFunction[row, x]) continue;
+
+                        bool bit = GetBit(codewords, bitIndex++);
+                        modules[row, x] = bit;
+                    }
+                }
+
+                col -= 2;
+                dir = -dir;
+            }
+        }
+
+        private static bool GetBit(byte[] data, int bitIndex)
+        {
+            int byteIndex = bitIndex >> 3;
+            int bitInByte = 7 - (bitIndex & 7);
+            if (byteIndex >= data.Length) return false;
+            return ((data[byteIndex] >> bitInByte) & 1) != 0;
+        }
+
+        private static byte[] ReadCodewords(bool[,] modules, bool[,] isFunction, int totalCodewords)
+        {
+            int size = modules.GetLength(0);
+            int totalBits = totalCodewords * 8;
+            var outBytes = new byte[totalCodewords];
+
+            int bitIndex = 0;
+            int dir = -1;
+            int col = size - 1;
+
+            while (col > 0 && bitIndex < totalBits)
+            {
+                if (col == 6) col--;
+
+                for (int row = (dir == -1 ? size - 1 : 0);
+                     (dir == -1 ? row >= 0 : row < size);
+                     row += dir)
+                {
+                    for (int c = 0; c < 2; c++)
+                    {
+                        int x = col - c;
+                        if (isFunction[row, x]) continue;
+                        if (bitIndex >= totalBits) break;
+
+                        bool bit = modules[row, x];
+                        int byteIndex = bitIndex >> 3;
+                        int bitInByte = 7 - (bitIndex & 7);
+                        if (bit) outBytes[byteIndex] |= (byte)(1 << bitInByte);
+                        bitIndex++;
+                    }
+                    if (bitIndex >= totalBits) break;
+                }
+
+                col -= 2;
+                dir = -dir;
+            }
+
+            return outBytes;
+        }
+
+        private static void ApplyMask(bool[,] modules, bool[,] isFunction, int mask)
+        {
+            int size = modules.GetLength(0);
+            for (int r = 0; r < size; r++)
+            for (int c = 0; c < size; c++)
+            {
+                if (isFunction[r, c]) continue;
+                if (MaskBit(mask, r, c))
+                    modules[r, c] = !modules[r, c];
+            }
+        }
+
+        private static bool MaskBit(int mask, int r, int c)
+        {
+            return mask switch
+            {
+                0 => ((r + c) & 1) == 0,
+                1 => (r & 1) == 0,
+                2 => (c % 3) == 0,
+                3 => ((r + c) % 3) == 0,
+                4 => (((r / 2) + (c / 3)) & 1) == 0,
+                5 => ((r * c) % 2 + (r * c) % 3) == 0,
+                6 => ((((r * c) % 2) + ((r * c) % 3)) & 1) == 0,
+                7 => ((((r + c) % 2) + ((r * c) % 3)) & 1) == 0,
+                _ => throw new ArgumentOutOfRangeException(nameof(mask))
+            };
+        }
+
+        private static void WriteFormatInfo(bool[,] modules, bool[,] isFunction, int ecLevelBits, int mask)
+        {
+            int format = (ecLevelBits << 3) | mask;
+            int bch = ComputeBCH(format, 0b10100110111, 10);
+            int bits15 = ((format << 10) | bch) ^ 0x5412;
+
+            int size = modules.GetLength(0);
+
+            int[] rPos = { 8,8,8,8,8,8,8,8,7,5,4,3,2,1,0 };
+            int[] cPos = { 0,1,2,3,4,5,7,8,8,8,8,8,8,8,8 };
+
+            for (int i = 0; i < 15; i++)
+            {
+                bool bit = ((bits15 >> (14 - i)) & 1) != 0;
+                modules[rPos[i], cPos[i]] = bit;
+                isFunction[rPos[i], cPos[i]] = true;
+            }
+
+            for (int i = 0; i < 8; i++)
+            {
+                bool bit = ((bits15 >> i) & 1) != 0;
+                modules[8, size - 1 - i] = bit;
+                isFunction[8, size - 1 - i] = true;
+            }
+            for (int i = 8; i < 15; i++)
+            {
+                bool bit = ((bits15 >> i) & 1) != 0;
+                modules[size - 15 + i, 8] = bit;
+                isFunction[size - 15 + i, 8] = true;
+            }
+        }
+
+        private static int ReadMaskFromFormat(bool[,] modules)
+        {
+            int[] rPos = { 8,8,8,8,8,8,8,8,7,5,4,3,2,1,0 };
+            int[] cPos = { 0,1,2,3,4,5,7,8,8,8,8,8,8,8,8 };
+
+            int bits15 = 0;
+            for (int i = 0; i < 15; i++)
+            {
+                bits15 <<= 1;
+                if (modules[rPos[i], cPos[i]]) bits15 |= 1;
+            }
+            bits15 ^= 0x5412;
+            int format = bits15 >> 10;
+            return format & 0b111;
+        }
+
+        private static int ComputeBCH(int value, int poly, int polyShift)
+        {
+            int v = value << polyShift;
+            int msbPoly = HighestBit(poly);
+            while (HighestBit(v) >= msbPoly)
+            {
+                int shift = HighestBit(v) - msbPoly;
+                v ^= (poly << shift);
+            }
+            return v;
+        }
+
+        private static int HighestBit(int x)
+        {
+            int hb = -1;
+            while (x != 0) { x >>= 1; hb++; }
+            return hb;
+        }
+
+        private static int PenaltyScore(bool[,] m)
+        {
+            int size = m.GetLength(0);
+            int penalty = 0;
+
+            for (int r = 0; r < size; r++)
+            {
+                penalty += RunPenalty(GetRow(m, r));
+            }
+            for (int c = 0; c < size; c++)
+            {
+                penalty += RunPenalty(GetCol(m, c));
+            }
+
+            for (int r = 0; r < size - 1; r++)
+            for (int c = 0; c < size - 1; c++)
+            {
+                bool v = m[r, c];
+                if (m[r, c + 1] == v && m[r + 1, c] == v && m[r + 1, c + 1] == v)
+                    penalty += 3;
+            }
+
+            penalty += FinderLikePenalty(m);
+
+            int dark = 0;
+            for (int r = 0; r < size; r++)
+            for (int c = 0; c < size; c++)
+                if (m[r, c]) dark++;
+
+            int total = size * size;
+            int percent = (dark * 100) / total;
+            int k = Math.Abs(percent - 50) / 5;
+            penalty += k * 10;
+
+            return penalty;
+        }
+
+        private static bool[] GetRow(bool[,] m, int r)
+        {
+            int size = m.GetLength(0);
+            var a = new bool[size];
+            for (int i = 0; i < size; i++) a[i] = m[r, i];
+            return a;
+        }
+
+        private static bool[] GetCol(bool[,] m, int c)
+        {
+            int size = m.GetLength(0);
+            var a = new bool[size];
+            for (int i = 0; i < size; i++) a[i] = m[i, c];
+            return a;
+        }
+
+        private static int RunPenalty(bool[] line)
+        {
+            int p = 0;
+            int run = 1;
+            for (int i = 1; i < line.Length; i++)
+            {
+                if (line[i] == line[i - 1]) run++;
+                else
+                {
+                    if (run >= 5) p += 3 + (run - 5);
+                    run = 1;
+                }
+            }
+            if (run >= 5) p += 3 + (run - 5);
+            return p;
+        }
+
+        private static int FinderLikePenalty(bool[,] m)
+        {
+            int size = m.GetLength(0);
+            int p = 0;
+
+            for (int r = 0; r < size; r++)
+            {
+                for (int c = 0; c <= size - 11; c++)
+                {
+                    if (m[r, c] && !m[r, c + 1] && m[r, c + 2] && m[r, c + 3] && m[r, c + 4] && !m[r, c + 5] && m[r, c + 6] &&
+                        !m[r, c + 7] && !m[r, c + 8] && !m[r, c + 9] && !m[r, c + 10])
+                        p += 40;
+
+                    if (!m[r, c] && !m[r, c + 1] && !m[r, c + 2] && !m[r, c + 3] && m[r, c + 4] && !m[r, c + 5] && m[r, c + 6] &&
+                        m[r, c + 7] && m[r, c + 8] && !m[r, c + 9] && m[r, c + 10])
+                        p += 40;
+                }
+            }
+
+            for (int c = 0; c < size; c++)
+            {
+                for (int r = 0; r <= size - 11; r++)
+                {
+                    if (m[r, c] && !m[r + 1, c] && m[r + 2, c] && m[r + 3, c] && m[r + 4, c] && !m[r + 5, c] && m[r + 6, c] &&
+                        !m[r + 7, c] && !m[r + 8, c] && !m[r + 9, c] && !m[r + 10, c])
+                        p += 40;
+
+                    if (!m[r, c] && !m[r + 1, c] && !m[r + 2, c] && !m[r + 3, c] && m[r + 4, c] && !m[r + 5, c] && m[r + 6, c] &&
+                        m[r + 7, c] && m[r + 8, c] && !m[r + 9, c] && m[r + 10, c])
+                        p += 40;
+                }
+            }
+
+            return p;
+        }
+
+        private static byte[] PackModules(bool[,] modules)
+        {
+            int size = modules.GetLength(0);
+            int bitCount = size * size;
+            int byteCount = (bitCount + 7) / 8;
+            var packed = new byte[byteCount];
+
+            int bitIndex = 0;
+            for (int r = 0; r < size; r++)
+            for (int c = 0; c < size; c++)
+            {
+                if (modules[r, c])
+                {
+                    int b = bitIndex >> 3;
+                    int bitInByte = 7 - (bitIndex & 7);
+                    packed[b] |= (byte)(1 << bitInByte);
+                }
+                bitIndex++;
+            }
+
+            return packed;
+        }
+
+        private sealed class BitBuffer
+        {
+            private readonly List<byte> _bytes = new List<byte>();
+            private int _bitLen;
+
+            public int BitLength => _bitLen;
+
+            public void AppendBits(int value, int count)
+            {
+                if (count < 0 || count > 31) throw new ArgumentOutOfRangeException(nameof(count));
+                for (int i = count - 1; i >= 0; i--)
+                {
+                    int bit = (value >> i) & 1;
+                    AppendBit(bit != 0);
+                }
+            }
+
+            private void AppendBit(bool bit)
+            {
+                int byteIndex = _bitLen >> 3;
+                int bitInByte = 7 - (_bitLen & 7);
+                if (byteIndex == _bytes.Count) _bytes.Add(0);
+                if (bit) _bytes[byteIndex] |= (byte)(1 << bitInByte);
+                _bitLen++;
+            }
+
+            public byte[] ToBytes()
+            {
+                int byteCount = (_bitLen + 7) / 8;
+                var arr = _bytes.ToArray();
+                if (arr.Length == byteCount) return arr;
+                var outArr = new byte[byteCount];
+                Array.Copy(arr, outArr, byteCount);
+                return outArr;
+            }
+        }
+
+        private sealed class BitReader
+        {
+            private readonly byte[] _data;
+            private int _bitPos;
+
+            public BitReader(byte[] data) => _data = data ?? throw new ArgumentNullException(nameof(data));
+
+            public int ReadBits(int count)
+            {
+                int v = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    int byteIndex = _bitPos >> 3;
+                    int bitInByte = 7 - (_bitPos & 7);
+                    int bit = ((_data[byteIndex] >> bitInByte) & 1);
+                    v = (v << 1) | bit;
+                    _bitPos++;
+                }
+                return v;
+            }
+        }
+
+        private static class ReedSolomon
+        {
+            private static readonly byte[] Exp = new byte[512];
+            private static readonly byte[] Log = new byte[256];
+
+            static ReedSolomon()
+            {
+                int x = 1;
+                for (int i = 0; i < 255; i++)
+                {
+                    Exp[i] = (byte)x;
+                    Log[(byte)x] = (byte)i;
+
+                    x <<= 1;
+                    if ((x & 0x100) != 0)
+                        x ^= 0x11D;
+
+                    x &= 0xFF;
+                }
+                for (int i = 255; i < 512; i++) Exp[i] = Exp[i - 255];
+            }
+
+            private static byte Mul(byte a, byte b)
+            {
+                if (a == 0 || b == 0) return 0;
+                int la = Log[a];
+                int lb = Log[b];
+                return Exp[la + lb];
+            }
+
+            public static byte[] ComputeECC(byte[] data, int eccLen)
+            {
+                byte[] gen = BuildGenerator(eccLen);
+
+                var ecc = new byte[eccLen];
+                foreach (byte d in data)
+                {
+                    byte factor = (byte)(d ^ ecc[0]);
+                    for (int i = 0; i < eccLen - 1; i++)
+                        ecc[i] = ecc[i + 1];
+
+                    ecc[eccLen - 1] = 0;
+
+                    for (int i = 0; i < eccLen; i++)
+                        ecc[i] ^= Mul(gen[i], factor);
+                }
+                return ecc;
+            }
+
+            private static byte[] BuildGenerator(int degree)
+            {
+                var poly = new List<byte> { 1 };
+                for (int i = 0; i < degree; i++)
+                {
+                    byte aPow = Exp[i];
+                    poly = PolyMul(poly, new List<byte> { 1, aPow });
+                }
+
+                var gen = new byte[degree];
+                for (int i = 0; i < degree; i++)
+                    gen[i] = poly[i + 1];
+                return gen;
+            }
+
+            private static List<byte> PolyMul(List<byte> p, List<byte> q)
+            {
+                var outp = new byte[p.Count + q.Count - 1];
+                for (int i = 0; i < p.Count; i++)
+                for (int j = 0; j < q.Count; j++)
+                    outp[i + j] ^= Mul(p[i], q[j]);
+                return new List<byte>(outp);
+            }
+        }
+    }
+}
+
+namespace Tebex.Headless
+{
+    #nullable enable
+        [Serializable]
+        public class AddPackagePayload
+        {
+            public int package_id;
+            public int quantity;
+            public Dictionary<string, string>? variable_data;
+            public string? type;
+
+            public AddPackagePayload(int packageId, int qty = 1, Dictionary<string, string>? variableData = null, string? type = null)
+            {
+                package_id = packageId;
+                quantity = qty;
+                variable_data = variableData;
+                this.type = type;
+            }
+        }
+
+        [Serializable]
+        public class Basket
+        {
+            public string ident = string.Empty;
+            public bool complete;
+            public string email = string.Empty;
+            public string username = string.Empty;
+            public List<BasketCoupon> coupons = new List<BasketCoupon>();
+            public List<BasketGiftCard> gift_cards = new List<BasketGiftCard>();
+            public string creator_code = string.Empty;
+            public string cancel_url = string.Empty;
+            public string complete_url = string.Empty;
+            public bool complete_auto_redirect;
+            public string country = string.Empty;
+            public string ip = string.Empty;
+            public string username_id = string.Empty;
+            public float base_price;
+            public float sales_tax;
+            public float total_price;
+            public string currency = string.Empty;
+            public List<BasketPackage> packages = new List<BasketPackage>();
+            [JsonConverter(typeof(EmptyArrayTolerantConverter<Dictionary<string, string>>))]
+            public Dictionary<string, string> custom = new Dictionary<string, string>();
+            [JsonConverter(typeof(EmptyArrayTolerantConverter<BasketLinks>))]
+            public BasketLinks links = new BasketLinks();
+        }
+
+        [Serializable]
+        public class BasketAuthLink
+        {
+            public string name = string.Empty;
+            public string url = string.Empty;
+        }
+
+        [Serializable]
+        public class BasketCoupon
+        {
+            public string coupon_code;
+
+            public BasketCoupon(string couponCode)
+            {
+                coupon_code = couponCode;
+            }
+        }
+
+        [Serializable]
+        public class BasketGiftCard
+        {
+            public string card_number = string.Empty;
+        }
+
+        [Serializable]
+        public class BasketLinks
+        {
+            public string payment = string.Empty;
+            public string checkout = string.Empty;
+        }
+
+        [Serializable]
+        public class BasketPackage
+        {
+            public int id = -1;
+            public string name = string.Empty;
+            public string description = string.Empty;
+            public InnerPackageMeta in_basket = new InnerPackageMeta();
+        }
+
+        [Serializable]
+        public class BasketRevenueShare
+        {
+            public string wallet_ref = string.Empty;
+            public float amount = -1.0f;
+            public int gateway_fee_percent = -1;
+        }
+
+    #nullable enable
+        [Serializable]
+        public class Category
+        {
+            public int id = -1;
+            public string name = string.Empty;
+            public string slug = string.Empty;
+            public string description = string.Empty;
+            public PackageCategory? parent = null;
+            public int order = -1;
+            public string display_type = string.Empty;
+            public bool tiered = false;
+            public List<Package> packages = new List<Package>();
+            public Tier? active_tier = null;
+        }
+
+    #nullable enable
+        [Serializable]
+        public class CreateBasketPayload
+        {
+            public string? email;
+            public string? username;
+            public string? cancel_url;
+            public string? complete_url;
+            public Dictionary<string, string> custom = new Dictionary<string, string>();
+            public bool complete_auto_redirect;
+
+            public CreateBasketPayload(string? email = null, string? username = null, string? cancelUrl = null,
+                string? completeUrl = null, Dictionary<string, string>? custom = null, bool completeAutoRedirect = true)
+            {
+                this.email = email;
+                this.username = username;
+                cancel_url = cancelUrl;
+                complete_url = completeUrl;
+                this.custom = custom ?? new Dictionary<string, string>();
+                complete_auto_redirect = completeAutoRedirect;
+            }
+        }
+
+        [Serializable]
+        public class CreatorCode
+        {
+            public string code;
+
+            public CreatorCode(string c)
+            {
+                code = c;
+            }
+        }
+
+        public class EmptyArrayTolerantConverter<T> : JsonConverter where T : new()
+        {
+            public override bool CanConvert(Type objectType) => objectType == typeof(T);
+
+            public override bool CanWrite => false;
+
+            public override object ReadJson(JsonReader reader, Type objectType, object existingValue,
+                JsonSerializer serializer)
+            {
+                if (reader.TokenType == JsonToken.StartArray)
+                {
+                    reader.Skip();
+                    return new T();
+                }
+                if (reader.TokenType == JsonToken.Null) return new T();
+
+                var value = new T();
+                serializer.Populate(reader, value);
+                return value;
+            }
+
+            public override void WriteJson(JsonWriter writer, object value, JsonSerializer serializer)
+                => throw new NotImplementedException();
+        }
+
+        [Serializable]
+        public class GiftCard
+        {
+            public string card_number;
+
+            public GiftCard(string cardNumber)
+            {
+                card_number = cardNumber;
+            }
+        }
+
+        [Serializable]
+        public class InnerPackageMeta
+        {
+            public int quantity = -1;
+            public float price = -1.0f;
+            public string gift_username_id = string.Empty;
+            public string gift_username = string.Empty;
+            public string gift_image = string.Empty;
+        }
+
+        [Serializable]
+        public class Package
+        {
+            public int id;
+            public string name = string.Empty;
+            public string description = string.Empty;
+            public string image = string.Empty;
+            public string type = string.Empty;
+            public PackageCategory category = new PackageCategory();
+            public float base_price;
+            public float sales_tax;
+            public float total_price;
+            public string currency = string.Empty;
+            public float prorate_price;
+            public float discount;
+            public bool disable_quantity;
+            public bool disable_gifting;
+            public string created_at = string.Empty;
+            public string updated_at = string.Empty;
+            public int order = -1;
+            public List<PackageVariable> variables = new List<PackageVariable>();
+        }
+
+        [Serializable]
+        public class PackageCategory
+        {
+            public int id;
+            public string name;
+        }
+
+        [Serializable]
+        public class PackageQuantityPayload
+        {
+            public int quantity;
+
+            public PackageQuantityPayload(int qty)
+            {
+                quantity = qty;
+            }
+        }
+
+        [Serializable]
+        public class PackageRemovePayload
+        {
+            public int package_id;
+
+            public PackageRemovePayload(int packageId)
+            {
+                package_id = packageId;
+            }
+        }
+
+        [Serializable]
+        public class PackageVariable
+        {
+            public int id = -1;
+            public string identifier = string.Empty;
+            public string description = string.Empty;
+            public int min_length;
+            public int max_length;
+            public string type = string.Empty;
+            public bool allow_colors;
+            public List<PackageVariableOption> options = new List<PackageVariableOption>();
+        }
+
+        [Serializable]
+        public class PackageVariableOption
+        {
+            public int id = -1;
+            public string name = string.Empty;
+            public string value = string.Empty;
+            public double price;
+            public double percentage;
+        }
+
+    #nullable enable
+        [Serializable]
+        public class Tier
+        {
+            public int id;
+            public string created_at = string.Empty;
+            public long username_id = -1L;
+            public Package package = new Package();
+            public bool active = false;
+            public string recurring_payment_reference = string.Empty;
+            public string next_payment_date = string.Empty;
+            public TierStatus status = new TierStatus();
+            public Package? pending_downgrade_package;
+        }
+
+        [Serializable]
+        public class TierStatus
+        {
+            public int id = -1;
+            public string status = string.Empty;
+        }
+
+        [Serializable]
+        public class TierUpgradeResponse
+        {
+            public bool success = false;
+            public string message = string.Empty;
+        }
+
+        [Serializable]
+        public class UpdateTierPayload
+        {
+            public int package_id;
+
+            public UpdateTierPayload(int packageId)
+            {
+                package_id = packageId;
+            }
+        }
+
+        [Serializable]
+        public class Webstore
+        {
+            public uint id;
+            public string description = string.Empty;
+            public string name = string.Empty;
+            public string webstore_url = string.Empty;
+            public string currency = string.Empty;
+            public string lang = string.Empty;
+            public string logo = string.Empty;
+            public string platform_type = string.Empty;
+            public string platform_type_id = string.Empty;
+            public DateTime created_at = DateTime.MinValue;
+        }
+
+        [Serializable]
+        public class WrappedBasket
+        {
+            public Basket data = new Basket();
+        }
+
+        [Serializable]
+        public class WrappedBasketLinks
+        {
+            public List<BasketAuthLink> data = new List<BasketAuthLink>();
+        }
+
+        [Serializable]
+        public class WrappedBasketPackages
+        {
+            public List<BasketPackage> data = new List<BasketPackage>();
+        }
+
+        [Serializable]
+        public class WrappedCategories
+        {
+            public List<Category> data = new List<Category>();
+        }
+
+        [Serializable]
+        public class WrappedCategory
+        {
+            public Category data = new Category();
+        }
+
+        [Serializable]
+        public class WrappedPackage
+        {
+            public Package data = new Package();
+        }
+
+        [Serializable]
+        public class WrappedPackages
+        {
+            public List<Package> data = new List<Package>();
+        }
+}
+
+namespace Tebex.Plugin
+{
+        [Serializable]
+        public class Account
+        {
+            public int id;
+            public string domain = string.Empty;
+            public string name = string.Empty;
+            public Currency currency = new Currency();
+            public bool online_mode;
+            public string game_type = string.Empty;
+            public bool log_events;
+            public string public_token;
+        }
+
+        [Serializable]
+        public class ActivePackage
+        {
+            public string txn_id = string.Empty;
+            public DateTime date;
+            public string expires_at;
+            public int quantity;
+            public PackageInfo package = new PackageInfo();
+
+            public bool HasExpiresAt()
+            {
+                return !string.IsNullOrEmpty(expires_at);
+            }
+
+            public DateTime GetExpiresAt()
+            {
+                return DateTime.Parse(expires_at);
+            }
+        }
+
+    #nullable enable
+        [Serializable]
+        public class Ban
+        {
+            public int id;
+            public DateTime time;
+            public string ip = string.Empty;
+            public string? payment_email;
+            public string reason = string.Empty;
+            public BanUserInfo user = new BanUserInfo();
+        }
+
+        [Serializable]
+        public class BanUserInfo
+        {
+            public string ign = string.Empty;
+            public string uuid = string.Empty;
+        }
+
+    #nullable enable
+        [Serializable]
+        public class Category
+        {
+            public int id;
+            public int order;
+            public string name = string.Empty;
+            public bool only_subcategories;
+            public List<Category> subcategories = new List<Category>();
+            public List<Package> packages = new List<Package>();
+            public object? gui_item;
+        }
+
+        [Serializable]
+        public class CheckoutResponse
+        {
+            public string url = string.Empty;
+            public string expires = string.Empty;
+            public string ident = string.Empty;
+        }
+
+        [Serializable]
+        public class Command
+        {
+            public int id;
+            [JsonProperty("command")]
+            public string command_to_run = string.Empty;
+            public long payment;
+            [JsonProperty("package")]
+            public long package_ref;
+            public CommandConditions conditions = new CommandConditions();
+            public PlayerInfo player = new PlayerInfo();
+        }
+
+        [Serializable]
+        public class CommandConditions
+        {
+            public int delay;
+            public int slots;
+        }
+
+        [Serializable]
+        public class CommandQueueMeta
+        {
+            public bool execute_offline;
+            public int next_check;
+            public bool more;
+        }
+
+        [Serializable]
+        public class CommandQueueResponse
+        {
+            public CommandQueueMeta meta = new CommandQueueMeta();
+            public List<DuePlayer> players = new List<DuePlayer>();
+        }
+
+    #nullable enable
+        [Serializable]
+        public class CommunityGoal
+        {
+            public int id;
+            public DateTime created_at;
+            public DateTime updated_at;
+            public int account;
+            public string name = string.Empty;
+            public string description = string.Empty;
+            public string image = string.Empty;
+            public double target;
+            public double current;
+            public int repeatable;
+            public DateTime? last_achieved;
+            public int times_achieved;
+            public string status = string.Empty;
+            public int sale;
+        }
+
+        [Serializable]
+        public class Coupon
+        {
+            public int id;
+            public string code = string.Empty;
+            public PromotionEffectiveListings effective = new PromotionEffectiveListings();
+            public PromotionDiscount discount = new PromotionDiscount();
+            public CouponExpiry expire = new CouponExpiry();
+            public string basket_type = string.Empty;
+            public DateTime start_date;
+            public int user_limit;
+            public int minimum;
+            public string username = string.Empty;
+            public string note = string.Empty;
+        }
+
+    #nullable enable
+        [Serializable]
+        public class CouponExpiry
+        {
+            public bool redeem_unlimited;
+            public bool expire_never;
+            public int limit;
+            public DateTime? date;
+        }
+
+        [Serializable]
+        public class CouponPage
+        {
+            public CouponPagination pagination = new CouponPagination();
+            public List<Coupon> data = new List<Coupon>();
+        }
+
+    #nullable enable
+        [Serializable]
+        public class CouponPagination
+        {
+            public int total_results;
+            public int current_page;
+            public int last_page;
+            public string? previous;
+            public string? next;
+        }
+
+        [Serializable]
+        public class CreateBanPayload
+        {
+            public string reason = string.Empty;
+            public string ip = string.Empty;
+            public string user = string.Empty;
+        }
+
+        [Serializable]
+        public class CreateCheckoutPayload
+        {
+            public int package_id;
+            public string username_id = string.Empty;
+        }
+
+        [Serializable]
+        public class CreateGiftCardPayload
+        {
+            public DateTime expires_at;
+            public string note = string.Empty;
+            public double amount;
+        }
+
+        [Serializable]
+        public class Currency
+        {
+            public string iso4217 = string.Empty;
+            public string symbol = string.Empty;
+        }
+
+        [Serializable]
+        public class CustomerPackagePurchaseRecord
+        {
+            public string transaction_id = string.Empty;
+            public DateTime date;
+            public int quantity;
+            public PurchaseRecordPackageInfo purchase_record_package = new PurchaseRecordPackageInfo();
+        }
+
+        [Serializable]
+        public class DeleteCommandsPayload
+        {
+            public int[] ids = Array.Empty<int>();
+        }
+
+        [Serializable]
+        public class DuePlayer
+        {
+            public int id;
+            public string name = string.Empty;
+            public string uuid = string.Empty;
+        }
+
+        [Serializable]
+        public class GatewayInfo
+        {
+            public int id;
+            public string name = string.Empty;
+        }
+
+    #nullable enable
+        [Serializable]
+        public class GiftCard
+        {
+            public int id;
+            public string code = string.Empty;
+            public GiftCardBalance balance = new GiftCardBalance();
+            public string note = string.Empty;
+            public bool voided;
+            public DateTime created_at;
+            public DateTime? expires_at;
+        }
+
+        [Serializable]
+        public class GiftCardBalance
+        {
+            public double starting = -1.0d;
+            public double remaining = -1.0d;
+            public string currency = string.Empty;
+        }
+
+        [Serializable]
+        public class JoinEvent
+        {
+            public string username_id;
+            public string event_type;
+            public DateTime event_date;
+            public string ip;
+
+            public JoinEvent(string usernameId, string eventType, string ipAddress)
+            {
+                username_id = usernameId;
+                event_type = eventType;
+                event_date = DateTime.UtcNow;
+                ip = ipAddress;
+            }
+        }
+
+        [Serializable]
+        public class ListingsResponse
+        {
+            public List<Category> categories = new List<Category>();
+        }
+
+        [Serializable]
+        public class NoteInfo
+        {
+            public string created_at = string.Empty;
+            public string note = string.Empty;
+        }
+
+        [Serializable]
+        public class OfflineCommandsMeta
+        {
+            public bool limited;
+        }
+
+        [Serializable]
+        public class OfflineCommandsResponse
+        {
+            public OfflineCommandsMeta meta = new OfflineCommandsMeta();
+            public List<Command> commands = new List<Command>();
+        }
+
+        [Serializable]
+        public class OnlineCommandPlayerMeta
+        {
+            public string avatar = string.Empty;
+            public string avatar_full = string.Empty;
+            public string steam_id = string.Empty;
+        }
+
+        [Serializable]
+        public class OnlineCommandsPlayer
+        {
+            public string id = string.Empty;
+            public string username = string.Empty;
+            public OnlineCommandPlayerMeta meta = new OnlineCommandPlayerMeta();
+        }
+
+        [Serializable]
+        public class OnlineCommandsResponse
+        {
+            public OnlineCommandsPlayer player = new OnlineCommandsPlayer();
+            public List<Command> commands = new List<Command>();
+        }
+
+    #nullable enable
+        [Serializable]
+        public class Package
+        {
+            public int id;
+            public string name = string.Empty;
+            public int order = -1;
+            public string image = string.Empty;
+            public double price = -1.0d;
+            public PackageSaleData? sale;
+            public int expiry_length;
+            public string expiry_period = string.Empty;
+            public string type = string.Empty;
+            public Category category = new Category();
+            public int global_limit;
+            public string global_limit_period = string.Empty;
+            public int user_limit;
+            public string user_limit_period = string.Empty;
+            public List<Server>? servers;
+            public List<object>? required_packages;
+            public bool require_any;
+            public bool create_giftcard;
+            public string show_until = string.Empty;
+            public string gui_item = string.Empty;
+            public bool disabled;
+            public bool disable_quantity;
+            public bool custom_price;
+            public bool choose_server;
+            public bool limit_expires;
+            public bool inherit_commands;
+            public bool variable_giftcard;
+            public string description = string.Empty;
+
+            public string GetFriendlyPayFrequency()
+            {
+                switch (type)
+                {
+                    case "single": return "One-Time";
+                    case "subscription": return $"Each {expiry_length} {expiry_period}";
+                    default: return "???";
+                }
+            }
+        }
+
+        [Serializable]
+        public class PackageInfo
+        {
+            public int id;
+            public string name = string.Empty;
+        }
+
+        [Serializable]
+        public class PackageSaleData
+        {
+            public bool active = false;
+            public double discount = -1.0d;
+        }
+
+    #nullable enable
+        [Serializable]
+        public class PaginatedPaymentInfo
+        {
+            public int total = -1;
+            public int per_page = -1;
+            public int current_page = -1;
+            public int last_page = -1;
+            public string? next_page_url = string.Empty;
+            public string? previous_page_url = string.Empty;
+            public int from = -1;
+            public int to = -1;
+            public List<PaymentDetails> data = new List<PaymentDetails>();
+        }
+
+        [Serializable]
+        public class PaidPlayer
+        {
+            public int id;
+            public string name = string.Empty;
+            public string uuid = string.Empty;
+        }
+
+    #nullable enable
+        [Serializable]
+        public class PaymentDetails
+        {
+            public int id;
+            public double amount;
+            public DateTime date;
+            public Currency currency = new Currency();
+            public GatewayInfo gateway = new GatewayInfo();
+            public string status = string.Empty;
+            public string email = string.Empty;
+            public PaidPlayer player = new PaidPlayer();
+            public List<PackageInfo> packages = new List<PackageInfo>();
+            public List<NoteInfo> notes = new List<NoteInfo>();
+            public string? creator_code;
+        }
+
+        [Serializable]
+        public class PlayerInfo
+        {
+            [JsonIgnore]
+            public string id = string.Empty;
+            [JsonProperty("name")]
+            public string username = string.Empty;
+            public OnlineCommandPlayerMeta meta = new OnlineCommandPlayerMeta();
+            public string uuid = string.Empty;
+            [JsonProperty("id")]
+            public int plugin_username_id;
+        }
+
+        [Serializable]
+        public class PlayerPaymentInfo
+        {
+            public string transaction_id = string.Empty;
+            public long time;
+            public double price;
+            public string currency = string.Empty;
+            public string status = string.Empty;
+        }
+
+        [Serializable]
+        public class PluginVersion
+        {
+            public string version = string.Empty;
+            public string released = string.Empty;
+        }
+
+        [Serializable]
+        public class PromotionDiscount
+        {
+            public string type = string.Empty;
+            public double percentage;
+            public double value;
+        }
+
+        [Serializable]
+        public class PromotionEffectiveListings
+        {
+            public string type = string.Empty;
+            public List<int> packages = new List<int>();
+            public List<int> categories = new List<int>();
+        }
+
+        [Serializable]
+        public class PurchaseRecordPackageInfo
+        {
+            public int id;
+            public string name = string.Empty;
+        }
+
+        [Serializable]
+        public class Sale
+        {
+            public int id;
+            public string name = string.Empty;
+            public PromotionEffectiveListings effective = new PromotionEffectiveListings();
+            public PromotionDiscount discount = new PromotionDiscount();
+            public int start;
+            public int expire;
+            public int order;
+        }
+
+        [Serializable]
+        public class Server
+        {
+            public int id;
+            public string name = string.Empty;
+        }
+
+        [Serializable]
+        public class Store
+        {
+            public Account account = new Account();
+            public Server server = new Server();
+        }
+
+        [Serializable]
+        public class TopUpGiftCardPayload
+        {
+            public string amount = string.Empty;
+        }
+
+        [Serializable]
+        public class UserLookupResponse
+        {
+            public PlayerInfo player = new PlayerInfo();
+            public int ban_count;
+            public int chargeback_rate;
+            public List<PlayerPaymentInfo> payments = new List<PlayerPaymentInfo>();
+            public object[] purchase_totals = Array.Empty<object>();
+        }
+
+        [Serializable]
+        public class WrappedBan
+        {
+            public Ban data = new Ban();
+        }
+
+        [Serializable]
+        public class WrappedBans
+        {
+            public List<Ban> data = new List<Ban>();
+        }
+
+        [Serializable]
+        public class WrappedCoupon
+        {
+            public Coupon data = new Coupon();
+        }
+
+        [Serializable]
+        public class WrappedGiftCard
+        {
+            public GiftCard data = new GiftCard();
+        }
+
+        [Serializable]
+        public class WrappedGiftCards
+        {
+            public List<GiftCard> data = new List<GiftCard>();
+        }
+
+        [Serializable]
+        public class WrappedSales
+        {
+            public List<Sale> data = new List<Sale>();
+        }
 }
