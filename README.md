@@ -10,6 +10,7 @@ This is our Oxide plugin designed specifically for Rust game server administrato
 - **Permission Replay**: Easily re-apply your players' permissions/groups after server wipes. All saved locally and fully customizable.
 - **In-Game Storefront UI**: Players can browse an in-game representation of your store, if enabled.
 - **QR Checkout**: Scan a QR code to checkout and pay with a mobile device instead of leaving the game.
+- **Subscriptions Self-Service**: Players can run `/subs` (configurable) to get a link to the Tebex portal, where they can log in and manage their active subscriptions.
 
 <img width="1290" height="949" alt="1" src="https://github.com/user-attachments/assets/0050bd6c-4df4-4010-9b3d-c776bd0f7e95" />
 <img width="1287" height="949" alt="2" src="https://github.com/user-attachments/assets/8f46daff-71b9-48b4-9deb-e702c3daf51a" />
@@ -36,6 +37,7 @@ The plugin is highly configurable to support a wide range of setups, both vanill
   "debug": false,
   "auto_report_logs": true,
   "enable_basket": true,
+  "check_for_updates": true,
   "track_permissions": true,
   "custom_permission_commands": [],
   "queue_check_seconds": 120,
@@ -54,6 +56,7 @@ The plugin is highly configurable to support a wide range of setups, both vanill
 | `debug` | `false` | Enables verbose server-log output. |
 | `auto_report_logs` | `true` | Whether the plugin sends telemetry/error events. |
 | `enable_basket` | `true` | Enables selecting multiple items from the in-game storefront. |
+| `check_for_updates` | `true` | On server start, checks for a newer plugin release and prints a console notice if one is available. |
 | `track_permissions` | `true` | Enables the permission replay feature, which saves any permissions issued. |
 | `custom_permission_commands` | `[]` | List of `{ label, grant_command, revoke_command }` deliverable commands so they're tracked and replayable too. |
 | `queue_check_seconds` | `120` | Baseline interval (seconds) between polls of the Tebex command queue for due purchases. Minimum is 30s. |
@@ -65,28 +68,29 @@ The plugin is highly configurable to support a wide range of setups, both vanill
 
 ### User command
 
-| Command | Access | Description |
-|---|---|---|
-| `/buy` | Everyone | Opens the in-game CUI store (browse categories/packages, basket, checkout, QR code). Falls back to printing the webstore link in console/chat if `disable_ui` is on. |
+| Command | Access | Description                                                                                                                                                          |
+|---------|---|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `/buy`  | Everyone | Opens the in-game CUI store (browse categories/packages, basket, checkout, QR code). Falls back to printing the webstore link in console/chat if `disable_ui` is on. |
+| `/subs` | Everyone | Gives the player a link to portal.tebex.io to log in and check their active subscriptions.                                                                                           |
 
 ### Admin commands (`/tebex <subcommand>`, requires `tebex.admin` or server console)
 
 | Section | Command | Description |
 |---|---|---|
-| Configuration | `/tebex secret <key>` | Set the webstore secret key |
-| Configuration | `/tebex info` | Show server and account information |
-| Configuration | `/tebex reload` | Reload configuration and listings |
-| Queue & Delivery | `/tebex forcecheck` | Run a queue check right now |
-| Queue & Delivery | `/tebex forcecheck <user>` | Check online commands for one cached user |
-| Queue & Delivery | `/tebex replay <user\|all>` | Re-apply tracked permissions after a wipe |
-| Store & Checkout | `/tebex checkout <pkgId>` | Get yourself an instant checkout link |
-| Store & Checkout | `/tebex sendlink <pkg> <user>` | Send a checkout link to a player |
-| Store & Checkout | `/tebex goals` | Show community goal progress |
-| User Management | `/tebex ban <name> <reason> [ip]` | Ban a player from the webstore |
-| Debug | `/tebex debug` | Opens the Plugin Health Check UI (or prints status from console) |
-| Debug | `/tebex debug <true\|false>` | Toggle verbose server logging |
-| Debug | `/tebex selftest` | Run the permission-ledger self-check |
-| Debug | `/tebex help` | Opens the command reference |
+| Configuration | `tebex secret <key>` | Set the webstore secret key |
+| Configuration | `tebex info` | Show server and account information |
+| Configuration | `tebex reload` | Reload configuration and listings |
+| Queue & Delivery | `tebex forcecheck` | Run a queue check right now |
+| Queue & Delivery | `tebex forcecheck <user>` | Check online commands for one cached user |
+| Queue & Delivery | `tebex replay <user\|all>` | Re-apply tracked permissions after a wipe |
+| Store & Checkout | `tebex checkout <pkgId>` | Get yourself an instant checkout link |
+| Store & Checkout | `tebex sendlink <pkg> <user>` | Send a checkout link to a player |
+| Store & Checkout | `tebex goals` | Show community goal progress |
+| User Management | `tebex ban <name> <reason> [ip]` | Ban a player from the webstore |
+| Debug | `tebex debug` | Opens the Plugin Health Check UI (or prints status from console) |
+| Debug | `tebex debug <true\|false>` | Toggle verbose server logging |
+| Debug | `tebex selftest` | Run the permission-ledger self-check |
+| Debug | `tebex help` | Opens the command reference |
 
 **Notes:**
 - `admin_command` and `buy_command` are configurable. `tebex`/`buy` are just the defaults.
@@ -95,6 +99,8 @@ The plugin is highly configurable to support a wide range of setups, both vanill
 Permission Replay lets you restore the permissions and groups your players **purchased** through your Tebex store after a server wipe, without asking buyers to re-purchase and without manually re-issuing commands.
 
 When a Tebex package delivers an Oxide permission or group, the plugin records who got what. After a wipe (or any time Oxide permissions get reset), you can run `tebex replay <username|all>` to re-apply tracked purchases.
+
+Both Oxide (`oxide.*` / `o.*`) and Carbon (`c.*`) permission commands are tracked. Replay issues `c.grant` / `c.usergroup add` when running under Carbon and `oxide.grant` / `oxide.usergroup add` under Oxide, so a ledger recorded on one framework replays correctly on the other.
 
 ## Tracking custom (non-Oxide) permissions
 
