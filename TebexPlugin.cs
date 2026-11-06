@@ -16,7 +16,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("TebexPlugin", "Tebex", "3.1.0")]
+    [Info("TebexPlugin", "Tebex", "3.1.1")]
     [Description("Official Tebex monetization plugin for Rust")]
     public class TebexPlugin : RustPlugin
     {
@@ -2349,7 +2349,7 @@ namespace Oxide.Plugins
             {
                 if (string.IsNullOrEmpty(base64) || base64.StartsWith("__")) return 0;
                 var bytes = Convert.FromBase64String(base64);
-                return FileStorage.server.Store(bytes, FileStorage.Type.png, community.net.ID);
+                return FileStorage.server.StoreByCrc(community.net.ID, FileStorage.Type.png, bytes);
             }
             catch (Exception e)
             {
@@ -4670,6 +4670,20 @@ namespace Oxide.Plugins
             Check("payload with a type includes it",
                 JsonConvert.SerializeObject(new Tebex.Headless.AddPackagePayload(123, type: "subscription"), JsonSettings)
                     .Contains("\"type\":\"subscription\""));
+
+            var community = CommunityEntity.ServerInstance;
+            if (community?.net != null)
+            {
+                var logoCrc = FileStorage.ComputeCrc(Convert.FromBase64String(LogoPngBase64));
+                Check("embedded logo stored under its CRC", _logoImageId == logoCrc,
+                    $"stored={_logoImageId}, expected {logoCrc}");
+                var stored = FileStorage.server.Get(community.net.ID, logoCrc, logoCrc);
+                Check("embedded logo readable from its CRC slot", stored != null && stored.Length > 0);
+            }
+            else
+            {
+                Check("embedded logo: CommunityEntity available", false, "CommunityEntity.ServerInstance is null");
+            }
 
             var total = passed + failures.Count;
             if (failures.Count == 0)
